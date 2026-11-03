@@ -4,6 +4,8 @@ import gql from 'graphql-tag';
 import { initialData } from '../../../e2e-shared/initial-data';
 import { FraudPreventionPlugin } from '../src/plugin';
 import { FraudPreventionService } from '../src/fraud-prevention.service';
+import { FraudPreventionController } from '../src/fraud-prevention.controller';
+import { RateLimiter } from '@huloglobal/vendure-licence-sdk';
 
 /** A card-like handler: settles immediately, supports full refunds and
  *  voids, so the reject → cancel + refund path exercises real Vendure
@@ -65,7 +67,7 @@ run('@huloglobal/vendure-plugin-fraud-prevention (MariaDB)', () => {
         },
         paymentOptions: { paymentMethodHandlers: [e2ePaymentHandler] },
         plugins: [
-            FraudPreventionPlugin.init({ publicBaseUrl: BASE, defaultAdminEmail: 'ops@test.local' }),
+            FraudPreventionPlugin.init({ publicBaseUrl: BASE, defaultAdminEmail: 'ops@test.local', rateLimit: { capacity: 25, windowMs: 60_000 } }),
         ],
     });
     const { server, adminClient, shopClient } = createTestEnvironment(config);
@@ -113,17 +115,20 @@ run('@huloglobal/vendure-plugin-fraud-prevention (MariaDB)', () => {
         expect(body).not.toHaveProperty('score');
     });
 
-    it('rate-limits the public /check endpoint', async () => {
-        let got429 = false;
-        for (let i = 0; i < 75; i++) {
+    it('rate-limits the public /check endpoint, honouring the rateLimit option', async () => {
+        let first429 = 0;
+        for (let i = 1; i <= 75; i++) {
             const res = await fetch(`${BASE}/fraud-prevention/check`, {
                 method: 'POST',
-                headers: { 'content-type': 'application/json', 'x-forwarded-for': '198.51.100.7' },
+                headers: { 'content-type': 'application/json' },
                 body: JSON.stringify({ email: 'x@y.z', orderValuePence: 1, channelId: 1 }),
             });
-            if (res.status === 429) { got429 = true; break; }
+            if (res.status === 429) { first429 = i; break; }
         }
-        expect(got429).toBe(true);
+        // The suite configures rateLimit { capacity: 25 } (the built-in default is 60); one
+        // request went to the test above.
+        expect(first429).toBeGreaterThan(20);
+        expect(first429).toBeLessThanOrEqual(27);
     });
 
     it('feed sync is not public', async () => {
@@ -672,5 +677,75 @@ run('@huloglobal/vendure-plugin-fraud-prevention (MariaDB)', () => {
         expect(body.refunds).toEqual([]);
         expect(body.blocklisted).toEqual([]);
         expect((await adminOrder(o.id)).state).toBe('Cancelled');
+    });
+
+    // ── Security regressions (2026-11-03 review) ──────────────────────
+    const controller = () => (server as any).app.get(FraudPreventionController) as FraudPreventionController;
+    /** Fresh token bucket on the public /check endpoint, so earlier tests do not throttle these. */
+    const resetCheckLimiter = (capacity = 60) => {
+        (controller() as any).limiter = new RateLimiter({ capacity, windowMs: 60_000 });
+    };
+    const publicCheck = async (body: any, headers: Record<string, string> = {}) => {
+        const res = await fetch(`${BASE}/fraud-prevention/check`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json', ...headers },
+            body: JSON.stringify(body),
+        });
+        return { status: res.status, body: await res.json() };
+    };
+
+    it('a spoofed X-Forwarded-For / CF-Connecting-IP neither resets the rate limit nor picks the scored IP', async () => {
+        resetCheckLimiter(3);
+        for (let i = 0; i < 3; i++) {
+            expect((await publicCheck({ email: 'x@y.z', orderValuePence: 1, channelId: 1 })).status).toBe(200);
+        }
+        for (const h of <Array<Record<string, string>>>[{ 'x-forwarded-for': '10.9.1.1' }, { 'x-forwarded-for': '10.9.2.1, 127.0.0.1' }, { 'cf-connecting-ip': '10.9.3.1' }]) {
+            expect((await publicCheck({ email: 'x@y.z', orderValuePence: 1, channelId: 1 }, h)).status).toBe(429);
+        }
+
+        // The caller cannot have someone else's address scored either.
+        await svc().addEntry('blocklist', 'ip', '192.0.2.66', 'e2e spoof');
+        resetCheckLimiter();
+        for (const h of <Array<Record<string, string>>>[{ 'x-forwarded-for': '192.0.2.66' }, { 'cf-connecting-ip': '192.0.2.66' }]) {
+            const r = await publicCheck({ email: 'spoof.test@example.com', orderValuePence: 1000, channelId: 1 }, h);
+            expect(r.status).toBe(200);
+            expect(r.body.riskLevel).toBe('low');
+        }
+    });
+
+    it('the public /check verdict does not reveal customer history, spend or list status for an e-mail', async () => {
+        // A real customer with a settled order, an allowlisted and a blocklisted address — all on one domain.
+        await placeOrder('returning.victim@example.com');
+        await svc().addEntry('whitelist', 'email', 'trusted.vip@example.com', 'e2e');
+        await svc().addEntry('blocklist', 'email', 'blocked.person@example.com', 'e2e');
+        resetCheckLimiter();
+        const levels: Record<string, string> = {};
+        for (const email of ['nobody.here@example.com', 'returning.victim@example.com', 'trusted.vip@example.com', 'blocked.person@example.com']) {
+            const r = await publicCheck({ email, orderValuePence: 600_000, channelId: 1 });
+            expect(r.status).toBe(200);
+            levels[email] = r.body.riskLevel;
+        }
+        const distinct = new Set(Object.values(levels));
+        if (distinct.size !== 1) throw new Error(`verdict depends on the e-mail: ${JSON.stringify(levels)}`);
+        // Spend oracle: moving the value across the daily-value limit for a real customer changes nothing either.
+        const low = await publicCheck({ email: 'returning.victim@example.com', orderValuePence: 1_000_000 - 12_000 - 1, channelId: 1 });
+        const high = await publicCheck({ email: 'returning.victim@example.com', orderValuePence: 1_000_000 - 12_000 + 1, channelId: 1 });
+        expect(low.body.riskLevel).toBe(high.body.riskLevel);
+    });
+
+    it('a case cannot be decided twice by concurrent approve and reject', async () => {
+        const o = await placeOrder('race.case@example.com');
+        await waitForAssessment(o.id);
+        const input = { channelId: 1, email: 'race.case@example.com', orderValuePence: o.total, orderId: num(o.id), orderCode: o.code };
+        const a = await svc().assess({ ...input, dryRun: true });
+        const caseId = await svc().createCase(input as any, { ...a, level: 'review', action: 'review' });
+        const [approved, rejected] = await Promise.all([
+            svc().resolveCase(caseId, 'approved', 'race'),
+            svc().resolveCase(caseId, 'rejected', 'race', { refund: true }),
+        ]);
+        const oks = [approved, rejected].filter(r => r.ok);
+        expect(oks).toHaveLength(1);
+        const decisions = (await raw().query(`SELECT action FROM fraud_log WHERE orderId = ? AND action IN ('approved', 'rejected')`, [num(o.id)])) as any[];
+        expect(decisions).toHaveLength(1);
     });
 });

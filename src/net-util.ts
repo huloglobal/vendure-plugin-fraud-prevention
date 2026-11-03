@@ -122,6 +122,69 @@ export function ipInCidr(ip: string, cidr: string): boolean {
     return (ipBig & mask) === (range.base & mask);
 }
 
+/** A syntactically valid IPv4 / IPv6 address after `normaliseIp` (brackets and an IPv4 `:port` stripped), or ''. */
+function cleanIp(raw: unknown): string {
+    let s = normaliseIp(raw);
+    if (s.startsWith('[')) s = s.slice(1, s.indexOf(']') > 0 ? s.indexOf(']') : undefined);
+    if (/^\d+\.\d+\.\d+\.\d+:\d+$/.test(s)) s = s.slice(0, s.lastIndexOf(':'));
+    s = normaliseIp(s);
+    return ipv4ToInt(s) != null || ipv6ToBigInt(s) != null ? s : '';
+}
+
+export interface ClientIpRequest {
+    headers: Record<string, string | string[] | undefined>;
+    ip?: string;
+    socket?: { remoteAddress?: string } | null;
+}
+
+export interface ClientIpOptions {
+    /** Proxies (addresses or CIDRs) whose forwarding headers are believed. */
+    trustedProxies?: string[];
+    /** Read `cf-connecting-ip` from a trusted proxy. Default true when `trustedProxies` is set. */
+    trustCloudflareHeader?: boolean;
+}
+
+function header(req: ClientIpRequest, name: string): string {
+    const v = req.headers?.[name];
+    return String(Array.isArray(v) ? v[0] ?? '' : v ?? '').trim();
+}
+
+/** True when the request's socket peer is one of `trustedProxies`. */
+export function fromTrustedProxy(req: ClientIpRequest, opts: ClientIpOptions = {}): boolean {
+    const proxies = opts.trustedProxies || [];
+    const peer = cleanIp(req.socket?.remoteAddress);
+    return !!peer && proxies.some(p => ipInCidr(peer, p));
+}
+
+/**
+ * The caller's address, never one it chooses. Forwarding headers are read
+ * only when the socket peer is a configured trusted proxy: then
+ * `cf-connecting-ip` (unless turned off), else the right-most
+ * `x-forwarded-for` hop that is not itself a trusted proxy. With trusted
+ * proxies configured, any other peer's socket address is used as is.
+ * Without them the address is `req.ip` — Express applies the host's own
+ * `trust proxy` setting there — or the socket address.
+ */
+export function clientIpFromRequest(req: ClientIpRequest, opts: ClientIpOptions = {}): string {
+    const proxies = opts.trustedProxies || [];
+    if (proxies.length && fromTrustedProxy(req, opts)) {
+        if (opts.trustCloudflareHeader !== false) {
+            const cf = cleanIp(header(req, 'cf-connecting-ip'));
+            if (cf) return cf;
+        }
+        const hops = header(req, 'x-forwarded-for').split(',').map(s => s.trim()).filter(Boolean);
+        for (let i = hops.length - 1; i >= 0; i--) {
+            const hop = cleanIp(hops[i]);
+            if (!hop) break; // malformed: everything to its left came from the client
+            if (!proxies.some(p => ipInCidr(hop, p))) return hop;
+        }
+        return cleanIp(req.socket?.remoteAddress);
+    }
+    // With trusted proxies configured, an untrusted peer is the client itself.
+    if (proxies.length) return cleanIp(req.socket?.remoteAddress) || cleanIp(req.ip);
+    return cleanIp(req.ip) || cleanIp(req.socket?.remoteAddress);
+}
+
 export interface NormalizedEmail {
     /** Lowercased original. */
     email: string;

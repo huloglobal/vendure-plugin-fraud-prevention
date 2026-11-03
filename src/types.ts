@@ -161,6 +161,16 @@ export interface FraudPreventionPluginOptions {
     };
     /** Rate limit for the public /fraud-prevention/check endpoint. */
     rateLimit?: { capacity: number; windowMs: number };
+    /** Reverse proxies / load balancers (addresses or CIDRs, IPv4 or IPv6)
+     *  whose forwarding headers the public /check endpoint believes. The
+     *  client address is then `cf-connecting-ip` or the right-most
+     *  `x-forwarded-for` hop that is not itself a trusted proxy. Unset:
+     *  headers are ignored and the address is Express's `req.ip` (the
+     *  host's `trust proxy` setting) or the socket address. */
+    trustedProxies?: string[];
+    /** Read `cf-connecting-ip` / `cf-ipcountry` from a trusted proxy.
+     *  Default true (only takes effect with `trustedProxies`). */
+    trustCloudflareHeader?: boolean;
     /** Prune fraud_log rows older than this many days. Default 180; 0 = keep forever. */
     logRetentionDays?: number;
     /** Disable the daily threat-feed sync cron (default false). */

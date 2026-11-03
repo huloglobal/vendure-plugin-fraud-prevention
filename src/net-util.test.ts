@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { ipInCidr, ipv4ToInt, isCidr, normalizeEmail, parseCidr } from './net-util';
+import { clientIpFromRequest, fromTrustedProxy, ipInCidr, ipv4ToInt, isCidr, normalizeEmail, parseCidr } from './net-util';
 
 describe('ipv4ToInt', () => {
     it('parses valid addresses', () => {
@@ -186,5 +186,36 @@ describe('isCidr / parseCidr', () => {
     it('rejects malformed ranges', () => {
         for (const bad of ['', '/24', '10.0.0.0/33', '10.0.0.0/8/1', '2001:db8::/129', '2001:db8::/x', 'example.com', '1.2.3', '2001:db8:::1'])
             expect(isCidr(bad), bad).toBe(false);
+    });
+});
+
+describe('clientIpFromRequest', () => {
+    const req = (remote: string, headers: Record<string, string> = {}, ip?: string) => ({ headers, socket: { remoteAddress: remote }, ip });
+    const proxies = ['127.0.0.1', '::1', '10.0.0.0/8'];
+
+    it('ignores forwarding headers without trusted proxies (req.ip, else the socket)', () => {
+        const r = req('203.0.113.5', { 'x-forwarded-for': '1.1.1.1', 'cf-connecting-ip': '2.2.2.2' });
+        expect(clientIpFromRequest(r)).toBe('203.0.113.5');
+        expect(clientIpFromRequest({ ...r, ip: '::ffff:198.51.100.4' })).toBe('198.51.100.4');
+    });
+
+    it('ignores forwarding headers from an untrusted peer even when proxies are configured', () => {
+        const r = req('203.0.113.5', { 'x-forwarded-for': '1.1.1.1', 'cf-connecting-ip': '2.2.2.2' }, '1.1.1.1');
+        expect(clientIpFromRequest(r, { trustedProxies: proxies })).toBe('203.0.113.5');
+        expect(fromTrustedProxy(r, { trustedProxies: proxies })).toBe(false);
+    });
+
+    it('takes the right-most untrusted X-Forwarded-For hop from a trusted peer', () => {
+        const r = req('::ffff:127.0.0.1', { 'x-forwarded-for': '6.6.6.6, 198.51.100.9, 10.1.2.3' });
+        expect(clientIpFromRequest(r, { trustedProxies: proxies })).toBe('198.51.100.9');
+        expect(fromTrustedProxy(r, { trustedProxies: proxies })).toBe(true);
+        // A malformed hop ends the walk; only the socket is then known.
+        expect(clientIpFromRequest(req('127.0.0.1', { 'x-forwarded-for': '6.6.6.6, junk, 10.1.2.3' }), { trustedProxies: proxies })).toBe('127.0.0.1');
+    });
+
+    it('prefers CF-Connecting-IP from a trusted peer unless turned off', () => {
+        const r = req('10.0.0.2', { 'x-forwarded-for': '198.51.100.9', 'cf-connecting-ip': '2001:db8::7' });
+        expect(clientIpFromRequest(r, { trustedProxies: proxies })).toBe('2001:db8::7');
+        expect(clientIpFromRequest(r, { trustedProxies: proxies, trustCloudflareHeader: false })).toBe('198.51.100.9');
     });
 });

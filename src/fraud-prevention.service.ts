@@ -125,6 +125,12 @@ export interface AssessInput {
     isReturningCustomer?: boolean;
     /** Dry-run: skip logging + case creation (Simulate tab). */
     dryRun?: boolean;
+    /** Anonymous storefront pre-check: only signals about the caller's own
+     *  attempt (its IP and that IP's lists/velocity, the e-mail's domain and
+     *  shape, value, country). No allowlist, no e-mail lists, no e-mail
+     *  velocity/spend and no customer history, so the verdict cannot be used
+     *  to learn anything about another person's address. */
+    publicCheck?: boolean;
 }
 
 export interface ResolveCaseResult {
@@ -680,6 +686,7 @@ export class FraudPreventionService implements OnModuleInit {
         const protectionOff = !cfg.enabled || cfg.mode === 'off';
 
         const norm = input.email ? normalizeEmail(input.email) : null;
+        const pub = input.publicCheck === true;
         if (input.ip) input.ip = normaliseIp(input.ip);
 
         // The two network lookups start now and are awaited where their signals are scored,
@@ -688,12 +695,13 @@ export class FraudPreventionService implements OnModuleInit {
         const mxP: Promise<boolean | null> | null = norm ? domainHasMx(norm.domain).catch(() => null) : null;
 
         // 0. Allowlist — trusted identities bypass everything.
-        if (await this.isAllowlisted(norm?.email, norm?.domain, input.ip)) {
+        if (!pub && await this.isAllowlisted(norm?.email, norm?.domain, input.ip)) {
             return { score: 0, level: 'low', signals: [], allowlisted: true, action: 'allow', mode: cfg.mode };
         }
 
-        // 1. Blocklists (manual + feeds), incl. CIDR ranges.
-        if (norm) {
+        // 1. Blocklists (manual + feeds), incl. CIDR ranges. The e-mail lists
+        //    are not consulted for an anonymous pre-check (list-status oracle).
+        if (norm && !pub) {
             const hits = await this.db.query(
                 `SELECT listType, source, value FROM fraud_blocklist
                  WHERE (listType = 'email' AND value IN (?, ?)) OR (listType = 'email_domain' AND value = ?) LIMIT 3`,
@@ -770,8 +778,9 @@ export class FraudPreventionService implements OnModuleInit {
         }
 
         // 5. Velocity — email identity. Uses the CANONICAL address so
-        //    person+1@gmail / person+2@gmail count as one identity.
-        if (norm) {
+        //    person+1@gmail / person+2@gmail count as one identity. Skipped
+        //    for an anonymous pre-check (it would reveal the address's spend).
+        if (norm && !pub) {
             const like = norm.canonical === norm.email
                 ? [norm.email]
                 : [norm.email, norm.canonical];
@@ -887,8 +896,13 @@ export class FraudPreventionService implements OnModuleInit {
         //    for a high-value first order. Counted by canonical email so the
         //    credit survives plus-tag variations, and simulate can override
         //    via isReturningCustomer.
+        //    An anonymous pre-check knows nothing about history (-1): neither
+        //    the trust credit nor the first-order caution, which would tell
+        //    a customer's address from a stranger's.
         let settledCount = 0;
-        if (input.isReturningCustomer !== undefined) {
+        if (pub) {
+            settledCount = -1;
+        } else if (input.isReturningCustomer !== undefined) {
             settledCount = input.isReturningCustomer ? 3 : 0;
         } else if (norm) {
             const like = norm.canonical === norm.email ? [norm.email] : [norm.email, norm.canonical];
@@ -904,7 +918,7 @@ export class FraudPreventionService implements OnModuleInit {
             push('returning_customer_3plus', 'Trusted returning customer', `${settledCount} settled orders`);
         } else if (settledCount >= 1) {
             push('returning_customer_2', 'Returning customer', `${settledCount} settled order(s)`);
-        } else if (input.orderValuePence > cfg.requireEmailVerificationAbovePence) {
+        } else if (settledCount === 0 && input.orderValuePence > cfg.requireEmailVerificationAbovePence) {
             push('new_customer_high_value', 'First order, high value',
                 `first order at £${(input.orderValuePence / 100).toFixed(2)}`);
         }
@@ -1205,10 +1219,18 @@ export class FraudPreventionService implements OnModuleInit {
         if (!rows.length) return { ok: false, message: 'Case not found' };
         const c = rows[0];
         if (c.status !== 'pending') return { ok: false, message: `Already ${c.status}` };
-        await this.db.query(
-            `UPDATE fraud_blocked_orders SET status = ?, reviewedAt = NOW(), reviewNotes = ? WHERE id = ?`,
+        // Claim the decision atomically: of two concurrent decisions (two admins,
+        // or the auto-release cron against a reject) only one may cancel, refund
+        // or release the order.
+        const claim = await this.db.query(
+            `UPDATE fraud_blocked_orders SET status = ?, reviewedAt = NOW(), reviewNotes = ? WHERE id = ? AND status = 'pending'`,
             [decision, notes || null, id],
+            { needAffected: true },
         );
+        if (Number(claim?.affectedRows ?? 0) < 1) {
+            const [now] = await this.db.query(`SELECT status FROM fraud_blocked_orders WHERE id = ?`, [id]).catch(() => []);
+            return { ok: false, message: `Already ${now?.status || 'decided'}` };
+        }
         const result: ResolveCaseResult = { ok: true, message: `Case ${decision}`, caseRow: c };
         if (decision === 'rejected' && c.orderId) {
             const cancel = opts.cancel ?? this.options.cancelOnReject ?? true;

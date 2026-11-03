@@ -240,7 +240,12 @@ becomes true within a second or two of placement.
 ### Storefront pre-check (optional)
 
 `POST /fraud-prevention/check` `{ email, orderValuePence, channelId }` →
-`{ allowed, riskLevel }` — rate-limited, minimal response shape by design.
+`{ allowed, riskLevel }` — rate-limited per client address, minimal response shape by design.
+The verdict covers only the caller's own attempt (its IP and that IP's lists and velocity,
+the e-mail's domain and shape, value, country). Customer history, e-mail spend/velocity and
+the e-mail allow/block lists are never consulted, so the endpoint cannot be used to learn
+anything about an address. The client address is the socket peer (or Express `req.ip`);
+behind a proxy, list it in `trustedProxies`.
 
 ### Options
 
@@ -251,6 +256,8 @@ becomes true within a second or two of placement.
 | `defaultAdminEmail` | — | Where fraud-alert emails go when no per-install setting exists |
 | `smtp` | `SMTP_*` env | SMTP transport for alerts and customer notices |
 | `rateLimit` | 60 / min | Rate limit for the public `/fraud-prevention/check` endpoint |
+| `trustedProxies` | — | Proxies (IPs/CIDRs) whose `cf-connecting-ip` / right-most untrusted `x-forwarded-for` hop / `cf-ipcountry` the pre-check believes |
+| `trustCloudflareHeader` | true | Read `cf-connecting-ip` / `cf-ipcountry` from a trusted proxy |
 | `logRetentionDays` | 180 | Prune `fraud_log` rows older than this (0 = keep) |
 | `disableFeedSync` | false | Skip the daily threat-feed sync |
 | `avsResolver` | — | Supply `CardChecks` (AVS, Radar, 3DS) for any gateway |

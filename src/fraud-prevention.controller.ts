@@ -5,7 +5,8 @@ import { RateLimiter, performSelfUpdate, selfUpdateEnv, evalInstanceId, describe
 
 import { BUY_URL, FraudPreventionService, PREMIUM_FEATURES } from './fraud-prevention.service';
 import { parseRiskLevel, parseThreeDsAuthenticated } from './avs';
-import { FraudPreventionPlugin } from './plugin';
+import { FraudPreventionPlugin, getOptions } from './plugin';
+import { clientIpFromRequest, fromTrustedProxy } from './net-util';
 import { CUSTOM_FEED_PRESETS, FRAUD_SOURCES } from './fraud-sources';
 import { FraudChannelConfig } from './types';
 
@@ -23,28 +24,39 @@ function denyUnlessAdmin(ctx: RequestContext, res: Response, write: boolean): bo
 
 @Controller('fraud-prevention')
 export class FraudPreventionController {
-    private limiter = new RateLimiter({ capacity: 60, windowMs: 60_000 });
+    // The documented `rateLimit` option (default 60 / min per client address).
+    private limiter = new RateLimiter({
+        capacity: getOptions().rateLimit?.capacity ?? 60,
+        windowMs: getOptions().rateLimit?.windowMs ?? 60_000,
+    });
 
     constructor(private service: FraudPreventionService) {}
 
     // ── Public: storefront pre-check (rate limited) ────────────────────
     @Post('check')
     async check(@Req() req: Request, @Res() res: Response, @Body() body: any) {
-        const ip = (req.headers['cf-connecting-ip'] as string)
-            || (req.headers['x-forwarded-for'] as string)?.split(',')[0]?.trim()
-            || req.socket.remoteAddress || '';
-        if (!this.limiter.allow(`check:${ip}`)) {
+        // The caller's own address, never one it chooses: forwarding headers
+        // count only from a configured trusted proxy (see clientIpFromRequest).
+        const ipOpts = { trustedProxies: getOptions().trustedProxies, trustCloudflareHeader: getOptions().trustCloudflareHeader };
+        const ip = clientIpFromRequest(req as any, ipOpts);
+        if (!this.limiter.allow(`check:${ip || 'unknown'}`)) {
             return res.status(429).json({ error: 'rate_limited' });
         }
         const channelId = Number(body?.channelId);
+        const cfCountry = ipOpts.trustCloudflareHeader !== false && fromTrustedProxy(req as any, ipOpts)
+            ? String(req.headers['cf-ipcountry'] || '') : '';
+        const country = String(body?.countryCode || cfCountry || '').trim().toUpperCase();
+        const value = Number(body?.orderValuePence || 0);
         const assessment = await this.service.assess({
             channelId: Number.isFinite(channelId) && channelId > 0 ? channelId : 1,
-            // The caller's own address, not one it chooses.
-            ip,
-            email: body.email,
-            orderValuePence: Number(body.orderValuePence || 0),
-            countryCode: body.countryCode || (req.headers['cf-ipcountry'] as string) || undefined,
+            ip: ip || undefined,
+            email: typeof body?.email === 'string' ? body.email.slice(0, 320) : undefined,
+            orderValuePence: Number.isFinite(value) && value > 0 ? value : 0,
+            countryCode: /^[A-Z]{2}$/.test(country) ? country : undefined,
             dryRun: true,
+            // Only signals about the caller's own attempt: no allowlist, e-mail
+            // lists, e-mail spend/velocity or customer history.
+            publicCheck: true,
         });
         // Public shape stays minimal — no signal internals for attackers to
         // probe. Explicit 200: a risk check is a read, not a 201 "create"

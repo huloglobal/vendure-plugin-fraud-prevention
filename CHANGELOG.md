@@ -5,6 +5,16 @@ documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) and this project
 adheres to [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.20.2] — 2026-11-03
+
+### Security
+- The public `POST /fraud-prevention/check` pre-check no longer reveals anything about an e-mail address. It used to run the full assessment, so its `riskLevel` told an anonymous caller whether an address was a customer (returning-customer credit), its last-24 h spend (moving `orderValuePence` across the daily-value limit) and whether it was allow- or blocklisted. It now scores only the caller's own attempt: no allowlist, no e-mail block lists, no e-mail velocity or spend, no customer history. The response shape is unchanged. Placed orders are still scored in full.
+- The pre-check's client address can no longer be chosen by the caller. It used to take `cf-connecting-ip` or the left-most `x-forwarded-for` entry from any client, so rotating the header bypassed the rate limit and let a caller have any address scored. Forwarding headers (and `cf-ipcountry`) are now believed only from proxies listed in the new `trustedProxies` option (right-most untrusted hop); otherwise the address is Express's `req.ip` or the socket. **Hosts behind a reverse proxy or Cloudflare should set `trustedProxies`**, or every pre-check is keyed on the proxy's address.
+
+### Fixed
+- Two concurrent decisions on one review case (two admins, or the hourly auto-release against a reject) could both succeed, so an order could be refunded and cancelled and also released and the customer told it was approved. The decision is now claimed with a conditional update; the second gets `ok: false`.
+- The documented `rateLimit` option was ignored (the endpoint was fixed at 60 / min); it now applies.
+
 ## [0.20.1] — 2026-10-28
 
 ### Changed
