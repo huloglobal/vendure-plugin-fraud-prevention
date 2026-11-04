@@ -1,3 +1,5 @@
+<p align="center"><a href="https://huloglobal.com/vendure-plugins/fraud-prevention/"><img src="https://huloglobal.com/vendure-plugins/logos/fraud-prevention.svg" width="96" height="96" alt="HULO Fraud Prevention logo"></a></p>
+
 # @huloglobal/vendure-plugin-fraud-prevention
 
 Full fraud-prevention suite for [Vendure](https://www.vendure.io/). Every placed
