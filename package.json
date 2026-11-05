@@ -1,10 +1,10 @@
 {
   "name": "@huloglobal/vendure-plugin-fraud-prevention",
-  "version": "0.20.3",
-  "description": "Full fraud-prevention suite for Vendure: signal-based risk scoring (velocity, disposable emails, block/allow lists, CIDR ranges, high-risk countries, failed-payment patterns, card AVS postcode/address mismatch, Stripe Radar risk level, 3-D Secure outcome), real server-side enforcement with monitor/enforce modes, a manual review queue with approve/reject workflow (reject cancels and refunds the order), public threat-feed sync (FireHOL, Spamhaus DROP, Tor exits, disposable-email domains), and a multi-tab admin dashboard.",
+  "version": "0.20.4",
+  "description": "Fraud prevention for Vendure: every order is risk-scored on the server (velocity, block and allow lists, disposable emails, card AVS, Stripe Radar, 3-D Secure), then logged or held for review, with threat-feed sync and an admin dashboard.",
   "license": "AGPL-3.0-or-later",
   "author": "Wayne Garrison <wayne@garrison.me.uk>",
-  "homepage": "https://github.com/huloglobal/vendure-plugin-fraud-prevention",
+  "homepage": "https://huloglobal.com/vendure-plugins/fraud-prevention/",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/huloglobal/vendure-plugin-fraud-prevention.git"
@@ -23,13 +23,13 @@
     "hulo-global-logo-dark.svg"
   ],
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "tsc -p tsconfig.build.json",
     "prepublishOnly": "yarn build",
     "test": "vitest run",
     "test:watch": "vitest"
   },
   "dependencies": {
-    "@huloglobal/vendure-licence-sdk": "^0.15.1"
+    "@huloglobal/vendure-licence-sdk": "^0.15.4"
   },
   "peerDependencies": {
     "@nestjs/common": ">=10.0.0",

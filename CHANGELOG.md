@@ -5,6 +5,17 @@ documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) and this project
 adheres to [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.20.4] — 2026-11-04
+
+### Fixed
+- **PostgreSQL: a review case is decided once.** With licence SDK 0.15.3 or older, the claim on a review decision always looked successful on Postgres, so two decisions on the same case at the same moment (two admins, or the auto-release job and a reject) could both go through. The plugin now requires licence SDK `^0.15.4`, and only the first decision acts. The first weekly report is no longer skipped either (it used to start a week late). MySQL and MariaDB were not affected.
+- **PostgreSQL: a licence key activated in the admin is now stored.** The plugin's licence store left out the conflict column that the Postgres upsert needs, so saving a key failed. Pasting a key into the admin applied it, answered with a server error and did not store it, so the plugin was unlicensed again after a restart. A key bought from the admin, which installs itself, was not stored either. MySQL and MariaDB were not affected.
+
+### Package metadata
+- `homepage` is now the product page, https://huloglobal.com/vendure-plugins/fraud-prevention/, instead of the GitHub repository.
+- A shorter `description` that npm shows in full (npm cuts descriptions at 255 characters).
+- The npm package no longer includes the plugin's compiled unit tests.
+
 ## [0.20.3] — 2026-11-04
 
 ### Documentation

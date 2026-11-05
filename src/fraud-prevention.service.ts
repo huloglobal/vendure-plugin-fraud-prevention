@@ -178,7 +178,7 @@ export class FraudPreventionService implements OnModuleInit {
         return adapterFor(this.connection.rawConnection);
     }
 
-    private licenceStore = new LicenceStore((sql, params) => this.db.query(sql, params));
+    private licenceStore = new LicenceStore((sql, params, opts) => this.db.query(sql, params, opts));
     /** Small per-plugin settings (weekly-report recipient, trial lead email) in the
      *  shared `hulo_plugin_prefs` table. */
     private prefs = new PluginPrefs((sql, params, opts) => this.db.query(sql, params, opts), SHORT_ID);
