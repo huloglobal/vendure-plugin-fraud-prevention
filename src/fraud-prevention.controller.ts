@@ -1,7 +1,7 @@
 import { Body, Controller, Delete, Get, Param, Post, Query, Req, Res } from '@nestjs/common';
 import type { Request, Response } from 'express';
 import { Ctx, Permission, RequestContext } from '@vendure/core';
-import { RateLimiter, performSelfUpdate, selfUpdateEnv, evalInstanceId, describeLicence, formatStat } from '@huloglobal/vendure-licence-sdk';
+import { RateLimiter, performSelfUpdate, selfUpdateEnv, evalInstanceId, describeLicence, formatStat, isAdminApiSession } from '@huloglobal/vendure-licence-sdk';
 
 import { BUY_URL, FraudPreventionService, PREMIUM_FEATURES } from './fraud-prevention.service';
 import { parseRiskLevel, parseThreeDsAuthenticated } from './avs';
@@ -15,7 +15,7 @@ import { FraudChannelConfig } from './types';
  *  request was rejected (response already sent). */
 function denyUnlessAdmin(ctx: RequestContext, res: Response, write: boolean): boolean {
     const needed = write ? [Permission.UpdateCatalog] : [Permission.ReadCatalog];
-    if (!ctx.userHasPermissions(needed)) {
+    if (!isAdminApiSession(ctx) || !ctx.userHasPermissions(needed)) {
         res.status(403).json({ error: 'forbidden' });
         return true;
     }
