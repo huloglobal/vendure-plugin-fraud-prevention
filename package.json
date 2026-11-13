@@ -1,7 +1,7 @@
 {
   "name": "@huloglobal/vendure-plugin-fraud-prevention",
-  "version": "0.20.6",
-  "description": "Fraud prevention for Vendure: every order is risk-scored on the server (velocity, block and allow lists, disposable emails, card AVS, Stripe Radar, 3-D Secure), then logged or held for review, with threat-feed sync and an admin dashboard.",
+  "version": "0.21.0",
+  "description": "Fraud prevention for Vendure: every order is risk-scored on the server (velocity, lists, disposable emails, card AVS/CVC, Stripe Radar, 3-D Secure); block-level orders are refused before the charge, risky ones held for review.",
   "license": "AGPL-3.0-only",
   "author": "Wayne Garrison <wayne@garrison.me.uk>",
   "homepage": "https://huloglobal.com/vendure-plugins/fraud-prevention/",

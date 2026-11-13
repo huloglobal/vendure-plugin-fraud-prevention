@@ -10,10 +10,14 @@
  */
 
 export { FraudPreventionPlugin, FraudPluginInitOptions, getOptions } from './plugin';
-export { FraudPreventionService, AssessInput, ResolveCaseResult } from './fraud-prevention.service';
+export { FraudPreventionService, AssessInput, ResolveCaseResult, GeneralSettings, ProxyHint, PREMIUM_FEATURES } from './fraud-prevention.service';
+export { FraudAssessedEvent, FraudPaymentRefusedEvent, FraudCaseOpenedEvent, FraudCaseResolvedEvent, FraudEventSubject } from './events';
+export { convertLimit, formatMinor, limitScale } from './money';
+export { fraudPreChargeProcess } from './order-process';
 export {
     DEFAULT_CONFIG,
     DEFAULT_WEIGHTS,
+    FRAUD_MODES,
     FraudAssessment,
     FraudChannelConfig,
     FraudMode,
@@ -22,7 +26,7 @@ export {
     RiskLevel,
 } from './types';
 export { FRAUD_SOURCES, CUSTOM_FEED_PRESETS } from './fraud-sources';
-export { ipInCidr, ipv4ToInt, ipv6ToBigInt, isCidr, parseCidr, normalizeEmail } from './net-util';
+export { ipInCidr, ipv4ToInt, ipv6ToBigInt, isCidr, isPublicIp, parseCidr, normalizeEmail } from './net-util';
 export {
     AvsCheck,
     AvsResult,

@@ -5,6 +5,39 @@ documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) and this project
 adheres to [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.21.0] — 2026-11-13
+
+### Added
+- **Hold mode (free).** A new per-channel mode between Monitor and Enforce: every shop order is scored on its move to `ArrangingPayment`, before any payment is taken, and a block-level order is refused there (neutral `OrderStateTransitionError`, logged as `refused`). Shop API only; admin draft orders are never refused; the check fails open. `preChargeCheck: false` turns it off.
+- **Enforce falls back to Hold** when the licence or evaluation lapses (it used to drop to Monitor), so a lapse never weakens protection below the free tier.
+- **Approve captures an authorised payment** (premium): approving a case settles the order's `Authorized` payments through `OrderService.settlePayment` (`captureOnApprove`, or `capture: false` per case). On the free tier the approval reports what is still authorised.
+- **HTTP fulfilment gate** (premium): `GET /fraud-prevention/gate/:orderId` and `GET /fraud-prevention/held`.
+- **Monitor-mode alerts** (premium): risky orders flagged in monitor or hold mode, and orders refused before payment, now alert by e-mail and chat.
+- **Unpaid orders are scored**: an order left in `ArrangingPayment` for 15 minutes is scored once as `unpaid`, and refused / unpaid attempts count towards IP velocity.
+- **CVC-fail** (30) and **card country ≠ billing country** (15) signals, from Stripe charges, payment metadata or `avsResolver`.
+- **Currency-aware limits**: value limits are in the channel's default currency, converted for orders in another currency; spend is summed per currency; amounts are formatted in their currency everywhere (no hard-coded £). New channels in high-unit currencies get scaled defaults.
+- **Misconfigured-proxy notice** on the Overview tab, with dismiss.
+- **Editable activity-log retention** (Settings), overriding the `logRetentionDays` option.
+- **Fraud risk column** on the admin orders list (column picker), backed by `GET /fraud-prevention/order-risk?ids=`.
+- **Extension events** on the EventBus (`FraudAssessedEvent`, `FraudPaymentRefusedEvent`, `FraudCaseOpenedEvent`, `FraudCaseResolvedEvent`) and the `extraSignals` option.
+- Activity filter for `refused`, `unpaid` and `shadow`.
+
+### Changed
+- **Premium:** e-mail and chat alerts, the weekly report and the setup checklist now need a licence or the evaluation (signal weights stay free). The weekly report is not sent and the checklist is empty on the free tier; settings are kept and they resume with a licence. `digest/preview` and `digest/send-test` answer 402 on the free tier.
+- The public `/check` answers `allowed: false` for what the pre-charge check would refuse (block level in hold or enforce mode).
+- `PREMIUM_FEATURES` matches the code: enforce + review queue, HTTP gate, threat feeds, alerts, weekly report and checklist. Manual lists are free (they always were).
+
+### Fixed
+- **IP intelligence called the free ip-api.com endpoint over HTTP on every new address** (commercial use is not allowed there). It is now opt-in (Settings → IP intelligence, off by default and off for existing installs), uses HTTPS `pro.ip-api.com` with the merchant's own key, and never looks up private or reserved addresses. The key is never returned by the API or logged.
+- **`holdFulfilment` was stored but never read.** With it off, cases still open in the review queue but `pendingOrderIds()`, `heldOrderIds()` and the gate release the order; rejected orders are always held.
+- **`cooldownMinutesAfterFailedPayment` was stored but never read.** An address that reached the failed-payment limit keeps the `failed_payments` signal for that many minutes after its latest failure, and in hold / enforce mode cannot start a payment meanwhile (0 = off).
+- **The `init()` options never reached the service**, so `avsResolver`, `smtp`, `defaultAdminEmail`, `publicBaseUrl` and `cancelOnReject` / `refundOnReject` were ignored by the scoring and review paths.
+- The daily-value signal counted the order being scored twice once it was placed.
+- `isAssessed()` / `assessedOrderIds()` ignore `refused` and `unpaid` rows, so the fulfilment gate never treats an unplaced attempt as assessed.
+
+### Database
+- New index `fraud_log(ip, createdAt)`. Settings live in the shared `hulo_plugin_prefs` table. No destructive changes; MariaDB/MySQL and PostgreSQL.
+
 ## [0.20.6] — 2026-11-13
 
 ### Security

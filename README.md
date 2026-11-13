@@ -32,7 +32,28 @@ Each fired signal adds weighted points (all weights overridable per channel):
 | Stripe Radar: elevated risk | 15 |
 | Plus-addressed email (`x+7@gmail`) | 12 |
 | 3-D Secure failed (no liability shift) | 10 |
+| Card CVC check failed (issuer verdict) | 30 |
+| Card issued in another country than the billing address | 15 |
 | Billing / shipping postcode differ (typed) | 8 |
+
+Value limits are in the channel's default currency (the Rules tab shows it).
+An order in another currency is compared against the limit converted by a
+rough per-currency factor, its spend is summed in its own currency only, and
+signal details show amounts in the order's currency. A new channel in yen or
+forint gets defaults scaled to that currency.
+
+IP velocity also counts orders from the address that were refused before the
+charge or left unpaid (see Hold mode). The failed-payments signal stays on for
+`cooldownMinutesAfterFailedPayment` (default 15, 0 = off) after an address
+reached `maxFailedPaymentsPerIpPerHour`.
+
+**IP intelligence (VPN / proxy / hosting, IP country vs billing country) is
+opt-in.** Settings → IP intelligence: switch it on and paste your own
+[ip-api.com Pro](https://members.ip-api.com/) key (or set the `ipApiKey`
+option). Lookups go over HTTPS to `pro.ip-api.com`, never to the free
+endpoint (which forbids commercial use); private, loopback and reserved
+addresses are never sent; answers are cached 30 days. Off by default, also for
+existing installs.
 
 Emails are canonicalised before velocity counting — `x+1@gmail.com`,
 `x+2@gmail.com` and `x.y@gmail.com` all count as one identity. Allowlisted
@@ -115,13 +136,26 @@ false, threeDsResult: 'failed' }` alongside the AVS fields (the type is
 
 ## Enforcement modes (per channel)
 
-- **Off** — nothing, not even logging.
+- **Off** — orders are still scored and logged as `shadow` (so you can see
+  what protection would have caught); nothing else happens.
 - **Monitor** — score + log every order; risky orders are flagged but never
   held. Start here and tune thresholds against the Activity tab.
-- **Enforce** — score ≥ review threshold opens a case in the Review queue and
+- **Hold** (free) — every shop order is scored on its move to
+  `ArrangingPayment`, before any payment is taken (an `OrderProcess` the
+  plugin registers). A block-level score, or an address in its failed-payment
+  cooldown, is refused: `transitionOrderToState` returns an
+  `OrderStateTransitionError` with a neutral message, no payment can be added,
+  and the attempt is logged as `refused`. Placed orders are scored again in
+  full (card checks included) and risky ones are flagged. Admin draft orders
+  are never refused, and the check **fails open** on any internal error.
+  Turn it off with `preChargeCheck: false`.
+- **Enforce** (premium; works as Hold without a licence or the evaluation) —
+  everything Hold does, plus: score ≥ review threshold opens a case in the Review queue and
   (with the host integration below) holds licence-key/goods fulfilment until
   a human approves; score ≥ block threshold additionally emails the customer
-  that their order is under verification. Approve releases + notifies;
+  that their order is under verification. Approve releases + notifies and
+  settles (captures) any Authorized payment through `OrderService.settlePayment`
+  (`captureOnApprove: false`, or `capture: false` per case, to opt out);
   reject cancels the order in Vendure (`OrderService.cancelOrder`, so every
   `OrderStateTransitionEvent` subscriber sees it), voids Authorized payments
   (card holds, bank transfers), refunds every settled payment in full through
@@ -132,7 +166,12 @@ false, threeDsResult: 'failed' }` alongside the AVS fields (the type is
   (`RefundOrderStateError`, a handler without `createRefund`, …) comes back in
   `warnings` and the audit log — the case still closes.
 
-## Threat feeds
+**Unpaid orders.** An order left in `ArrangingPayment` for 15 minutes
+(abandoned, or every payment failed) is scored once and logged as `unpaid`, so
+velocity counts it and the orders-list column shows its score. No case, hold
+or alert. If it is paid later it is scored again in full.
+
+## Threat feeds (premium)
 
 Daily sync (03:00) into the blocklist: **FireHOL Level 1**, **Spamhaus DROP**
 (IPv4 and IPv6 CIDR ranges are matched), **Tor exit nodes**, and the
@@ -163,18 +202,26 @@ plugins: [
 FraudPreventionPlugin.uiExtensions,
 ```
 
-This registers three things:
+This registers four things:
 
 - **Sales → Fraud Prevention** in the admin navigation, opening the multi-tab
   dashboard (Overview, Rules, Review queue, Lists, Simulate, Activity, Settings).
   It needs the `ReadCatalog` permission, the same as the page's read endpoints.
 - A **fraud panel on every order-detail page** showing the score, the signals
   that fired and the review case, if any.
+- An optional **Fraud risk column on the orders list** (pick it in the list's
+  column selector): score, and whether the order is in review, rejected,
+  refused, unpaid or flagged. One request per page of orders.
 - A **dashboard widget** — Dashboard → Add widget → **Fraud Prevention** —
   with the last seven days' figures (orders scored, risky orders intercepted,
   value intercepted) and a link to the page.
 
 ## Weekly report, setup checklist and dashboard widget
+
+The weekly report and the setup checklist are **premium** (licence or the
+evaluation). On the free tier the report is not sent and the checklist is not
+shown; when a licence lapses they stop, and settings are kept. The dashboard
+widget is free.
 
 **Weekly report.** Every Monday at 08:00 (server-local time) the plugin emails
 a short report covering the previous seven days, with the week before for
@@ -237,7 +284,36 @@ the batch `assessedOrderIds(ids)`) closes the race between `OrderPlacedEvent`
 and the guard's asynchronous assessment: an order that has not been scored
 yet has no case to hold it, so fulfil only once both are true. Every placed
 order gets a `fraud_log` row — even with the channel off — so `isAssessed`
-becomes true within a second or two of placement.
+becomes true within a second or two of placement (`refused` and `unpaid` rows
+do not count). With **Hold fulfilment** off on a channel, its cases still open
+in the review queue but `pendingOrderIds()` / `heldOrderIds()` and the gate
+below release the order (rejected orders are always held).
+
+**HTTP fulfilment gate (premium).** For fulfilment outside Vendure, with an
+Admin-API session or token (`ReadCatalog`):
+
+- `GET /fraud-prevention/gate/:orderId` → `{ orderId, assessed, held, caseStatus, releasable }` — release only when `releasable`;
+- `GET /fraud-prevention/held` → `{ orderIds }` — never fulfil these.
+
+Both answer `402 licence_required` on the free tier.
+
+### Extension events and host signals
+
+The plugin publishes on Vendure's `EventBus` (exported from the package):
+`FraudAssessedEvent` (`stage`: `pre-charge`, `placed` or `unpaid`),
+`FraudPaymentRefusedEvent`, `FraudCaseOpenedEvent` and
+`FraudCaseResolvedEvent`. The `extraSignals(input, config)` option adds your
+own signals to every assessment (`{ key, label, points, detail }`; per-channel
+weights can override by key; a throw is ignored).
+
+### Misconfigured proxy notice
+
+When storefront requests carry `x-forwarded-for` / `cf-connecting-ip` /
+`x-real-ip` from a peer that is not a trusted proxy (so the header is ignored)
+and that peer forwarded for three or more different public addresses in a
+week, the Overview tab says so: behind it every customer is scored with the
+proxy's address. Add the proxy to `trustedProxies` (or Express `trust proxy`),
+or dismiss the notice. Only a hash of the client addresses is kept.
 
 ### Storefront pre-check (optional)
 
@@ -260,7 +336,11 @@ behind a proxy, list it in `trustedProxies`.
 | `rateLimit` | 60 / min | Rate limit for the public `/fraud-prevention/check` endpoint |
 | `trustedProxies` | — | Proxies (IPs/CIDRs) whose `cf-connecting-ip` / right-most untrusted `x-forwarded-for` hop / `cf-ipcountry` the pre-check believes |
 | `trustCloudflareHeader` | true | Read `cf-connecting-ip` / `cf-ipcountry` from a trusted proxy |
-| `logRetentionDays` | 180 | Prune `fraud_log` rows older than this (0 = keep) |
+| `logRetentionDays` | 180 | Prune `fraud_log` rows older than this (0 = keep); Settings → Activity log retention overrides it once saved |
+| `ipApiKey` | — | ip-api.com Pro key (overrides the key saved in Settings; IP intelligence must still be switched on there) |
+| `preChargeCheck` | true | Hold / enforce mode's check on the move to `ArrangingPayment` |
+| `captureOnApprove` | true | Approving a case settles the order's Authorized payments (premium) |
+| `extraSignals` | — | Host-supplied signals for every assessment |
 | `disableFeedSync` | false | Skip the daily threat-feed sync |
 | `avsResolver` | — | Supply `CardChecks` (AVS, Radar, 3DS) for any gateway |
 | `cancelOnReject` | true | Rejecting a case cancels the order through Vendure |
@@ -268,9 +348,19 @@ behind a proxy, list it in `trustedProxies`.
 
 ## Licensing
 
-Without a licence key the plugin runs in the **free tier**: monitor mode,
-manual lists and simulate. Enforce mode, review-queue holds, threat-feed sync
-and email alerts require a licence from
+**Free:** scoring of every order (unpaid ones included) with all signals,
+off / monitor / **hold** mode (block-level orders refused before the charge,
+failed-payment cooldown), manual allow/block lists, custom signal weights,
+thresholds, simulate, lookup, the activity log with editable retention, the
+order panel and orders-list column, opt-in IP intelligence with your own key,
+the proxy notice, the dashboard widget, extension events.
+
+**Premium** (licence or the 14-day evaluation): enforce mode with the review
+queue (approve captures an authorised payment, reject cancels and refunds),
+the HTTP fulfilment gate, nightly threat feeds and custom feed URLs, e-mail and
+chat alerts (monitor-mode alerts included), the weekly report and the setup
+checklist. When a licence lapses, enforce works as hold and the premium parts
+stop; data and settings are kept. Licences:
 https://huloglobal.com/vendure-plugins/fraud-prevention/.
 
 ## Compatibility
@@ -283,8 +373,8 @@ and list data. Block/allow list ranges accept IPv4 and IPv6 CIDR notation.
 
 ## License
 
-AGPL-3.0-or-later — commercial licences available from HULO Global.
+AGPL-3.0-only — commercial licences available from HULO Global.
 
 ## Buying a licence
 
-Pick monthly or annual on the plugin's admin banner and click **Start 14-day free trial** (card required, nothing charged until day 15, cancel any time), or choose lifetime — checkout opens in a new tab and the key installs itself within a minute. You can also buy at https://elite.charity/licence/buy/vendure-plugin-fraud-prevention and paste the emailed key into the admin.
+Pick monthly or annual on the plugin's admin banner and click **Subscribe** (every install gets a 14-day evaluation with everything on and no card; the first charge falls when it ends, cancel any time), or choose lifetime — checkout opens in a new tab and the key installs itself within a minute. You can also buy at https://elite.charity/licence/buy/vendure-plugin-fraud-prevention and paste the emailed key into the admin.
