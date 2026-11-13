@@ -6,7 +6,9 @@ interface FraudConfig {
     channelId: number;
     channelCode?: string;
     enabled: boolean;
-    mode: 'off' | 'monitor' | 'enforce';
+    mode: 'off' | 'monitor' | 'hold' | 'enforce';
+    /** Channel default currency: the value limits are in its minor units. */
+    currencyCode?: string;
     reviewThreshold: number;
     blockThreshold: number;
     holdFulfilment: boolean;
@@ -109,10 +111,10 @@ type Tab = 'overview' | 'rules' | 'review' | 'lists' | 'simulate' | 'lookup' | '
                 <div>
                     <strong>⏳ Full-featured evaluation</strong> —
                     <ng-container *ngIf="meta.eval?.daysRemaining != null; else evalNoClock">
-                        <strong>{{ meta.eval.daysRemaining }} day{{ meta.eval.daysRemaining === 1 ? '' : 's' }} left</strong> with everything enabled — enforce mode, review-queue holds, threat feeds and email alerts included.
+                        <strong>{{ meta.eval.daysRemaining }} day{{ meta.eval.daysRemaining === 1 ? '' : 's' }} left</strong> with everything enabled — enforce mode, the review queue, threat feeds, alerts and the weekly report included.
                     </ng-container>
-                    <ng-template #evalNoClock>everything is enabled — enforce mode, review-queue holds, threat feeds and email alerts included.</ng-template>
-                    Afterwards the plugin drops to the free tier (monitor + simulate only).
+                    <ng-template #evalNoClock>everything is enabled — enforce mode, the review queue, threat feeds, alerts and the weekly report included.</ng-template>
+                    Afterwards the plugin drops to the free tier: scoring, monitor and hold mode, lists, weights and simulate keep working.
                     <div class="banner-extra" *ngIf="meta.premiumFeatures?.length">Included now: {{ meta.premiumFeatures.join(' · ') }}</div>
                     <div class="banner-extra" *ngIf="meta.recentStats?.length"><strong>So far:</strong> {{ statsLine() }}</div>
                 </div>
@@ -130,8 +132,8 @@ type Tab = 'overview' | 'rules' | 'review' | 'lists' | 'simulate' | 'lookup' | '
             </div>
             <div class="update-banner major" *ngIf="meta.tier !== 'trial'">
                 <div>
-                    <strong>🔓 Free tier</strong> — premium features need a licence. Subscribe below (monthly or annual, cancel any time) or buy a lifetime licence. Monitoring, manual lists and simulate stay active; enforce mode,
-                    review-queue holds, threat-feed sync and email alerts need a licence. Your rules are saved and reactivate instantly with a key.
+                    <strong>🔓 Free tier</strong> — premium features need a licence. Subscribe below (monthly or annual, cancel any time) or buy a lifetime licence. Scoring, monitor and hold mode (block-level orders refused before the charge), manual lists, weights and simulate stay active; enforce mode,
+                    the review queue, threat-feed sync, alerts and the weekly report need a licence. Your rules are saved and reactivate instantly with a key.
                     <div class="banner-extra" *ngIf="meta.premiumFeatures?.length">With a licence: {{ meta.premiumFeatures.join(' · ') }}</div>
                     <div class="banner-extra" *ngIf="meta.recentStats?.length"><strong>{{ meta.eval?.source === 'server' ? 'During your evaluation:' : 'So far:' }}</strong> {{ statsLine() }}</div>
                 </div>
@@ -208,6 +210,16 @@ type Tab = 'overview' | 'rules' | 'review' | 'lists' | 'simulate' | 'lookup' | '
 
         <!-- ============================================================ OVERVIEW -->
         <ng-container *ngIf="!loading && current && tab === 'overview'">
+            <vdr-page-block *ngIf="proxyHint">
+                <div class="card setup-card" role="status">
+                    <div class="card-block">
+                        <h3 class="step-title" style="margin:0 0 6px">Every customer may be scored with your proxy's address</h3>
+                        <p class="hint">Requests from <strong class="mono">{{ proxyHint.peers.join(', ') }}</strong> carried a <code>{{ proxyHint.header }}</code> header naming {{ proxyHint.clients }} different public addresses, but that peer is not a trusted proxy, so the header was ignored. Behind a CDN or reverse proxy that is not listed, velocity and IP-list signals lump all customers together.
+                        Add it to the plugin's <code>trustedProxies</code> option (or the host's Express <code>trust proxy</code> setting) and restart.</p>
+                        <div class="picker"><button class="gbtn gbtn-ghost gbtn-sm" (click)="dismissProxyHint()">Not my proxy — dismiss</button></div>
+                    </div>
+                </div>
+            </vdr-page-block>
             <vdr-page-block *ngIf="setupVisible()">
                 <div class="card setup-card">
                     <div class="card-block">
@@ -256,8 +268,8 @@ type Tab = 'overview' | 'rules' | 'review' | 'lists' | 'simulate' | 'lookup' | '
                         <div class="kpi-sub">last 30 days · {{ stats?.intercepted30?.held || 0 }} held · {{ stats?.intercepted30?.blocked || 0 }} blocked</div>
                     </div>
                     <div class="kpi">
-                        <div class="kpi-label">£ value intercepted</div>
-                        <div class="kpi-num">£{{ ((stats?.intercepted30?.riskyValuePence || 0) / 100) | number:'1.2-2' }}</div>
+                        <div class="kpi-label">Value intercepted</div>
+                        <div class="kpi-num">{{ ((stats?.intercepted30?.riskyValuePence || 0) / 100) | currency:ccy }}</div>
                         <div class="kpi-sub">last 30 days · order totals held or blocked</div>
                     </div>
                 </div>
@@ -332,17 +344,22 @@ type Tab = 'overview' | 'rules' | 'review' | 'lists' | 'simulate' | 'lookup' | '
                             <label class="mode-card" [class.active]="current.mode === 'off'">
                                 <input type="radio" name="fmode" value="off" [(ngModel)]="current.mode" (ngModelChange)="markDirty()">
                                 <div class="mode-title">Off</div>
-                                <div class="mode-body">No scoring, no logging. Orders flow untouched.</div>
+                                <div class="mode-body">Orders flow untouched. They are still scored in the background (shadow) so you can see what protection would have caught.</div>
                             </label>
                             <label class="mode-card" [class.active]="current.mode === 'monitor'">
                                 <input type="radio" name="fmode" value="monitor" [(ngModel)]="current.mode" (ngModelChange)="markDirty()">
                                 <div class="mode-title">Monitor</div>
                                 <div class="mode-body">Score + log every order, flag the risky ones — but never hold anything. The safe way to tune thresholds.</div>
                             </label>
+                            <label class="mode-card" [class.active]="current.mode === 'hold'">
+                                <input type="radio" name="fmode" value="hold" [(ngModel)]="current.mode" (ngModelChange)="markDirty()">
+                                <div class="mode-title">Hold <span class="mini-chip">free</span></div>
+                                <div class="mode-body">Block-level orders are refused before the customer is charged (and an address in its failed-payment cooldown cannot pay). Other risky orders are flagged.</div>
+                            </label>
                             <label class="mode-card" [class.active]="current.mode === 'enforce'">
-                                <input type="radio" name="fmode" value="enforce" [(ngModel)]="current.mode" (ngModelChange)="markDirty()" [disabled]="premiumLocked">
+                                <input type="radio" name="fmode" value="enforce" [(ngModel)]="current.mode" (ngModelChange)="markDirty()" [disabled]="premiumLocked && current.mode !== 'enforce'">
                                 <div class="mode-title">Enforce <span class="mini-chip" *ngIf="premiumLocked">licence required</span></div>
-                                <div class="mode-body">Risky orders are held in the review queue and licence keys wait for your approval.</div>
+                                <div class="mode-body">Everything Hold does, plus risky paid orders wait in the review queue: approve captures an authorised payment, reject cancels and refunds.<span *ngIf="premiumLocked"> Without a licence it works as Hold.</span></div>
                             </label>
                         </div>
                     </div>
@@ -394,7 +411,7 @@ type Tab = 'overview' | 'rules' | 'review' | 'lists' | 'simulate' | 'lookup' | '
                             <div class="form-row">
                                 <label class="check-label">
                                     <input type="checkbox" [(ngModel)]="current.holdFulfilment" (ngModelChange)="markDirty()">
-                                    Hold licence-key fulfilment while a case is pending
+                                    Hold fulfilment while a case is pending <small>(off: cases still open in the review queue, but the gate and <code>heldOrderIds()</code> release the order)</small>
                                 </label>
                             </div>
                             <div class="form-row">
@@ -436,15 +453,15 @@ type Tab = 'overview' | 'rules' | 'review' | 'lists' | 'simulate' | 'lookup' | '
                                 <input class="form-input" type="number" min="1" [(ngModel)]="current.maxOrdersPerEmailPerDay" (ngModelChange)="markDirty()">
                             </div>
                             <div class="form-row">
-                                <label>Max daily value per email <small>(£)</small></label>
+                                <label>Max daily value per email <small>({{ ccy }})</small></label>
                                 <input class="form-input" type="number" min="0" [ngModel]="current.maxDailyValuePerEmailPence / 100" (ngModelChange)="current.maxDailyValuePerEmailPence = $event * 100; markDirty()">
                             </div>
                             <div class="form-row">
-                                <label>Max order value <small>(£)</small></label>
+                                <label>Max order value <small>({{ ccy }})</small></label>
                                 <input class="form-input" type="number" min="0" [ngModel]="current.maxOrderValuePence / 100" (ngModelChange)="current.maxOrderValuePence = $event * 100; markDirty()">
                             </div>
                             <div class="form-row">
-                                <label>First-order caution above <small>(£)</small></label>
+                                <label>First-order caution above <small>({{ ccy }})</small></label>
                                 <input class="form-input" type="number" min="0" [ngModel]="current.requireEmailVerificationAbovePence / 100" (ngModelChange)="current.requireEmailVerificationAbovePence = $event * 100; markDirty()">
                             </div>
                         </div>
@@ -507,7 +524,7 @@ type Tab = 'overview' | 'rules' | 'review' | 'lists' | 'simulate' | 'lookup' | '
                             <thead><tr><th>Order</th><th>Customer</th><th>Score</th><th>Signals</th><th>Age</th><th>Status</th><th></th></tr></thead>
                             <tbody>
                                 <tr *ngFor="let c of cases">
-                                    <td><strong>{{ c.orderCode || c.liveOrderCode || ('#' + c.orderId) }}</strong><div class="hint" *ngIf="c.subTotalWithTax">£{{ (c.subTotalWithTax / 100).toFixed(2) }}</div></td>
+                                    <td><strong>{{ c.orderCode || c.liveOrderCode || ('#' + c.orderId) }}</strong><div class="hint" *ngIf="c.subTotalWithTax">{{ (c.subTotalWithTax / 100) | currency:ccy }}</div></td>
                                     <td>{{ c.email }}<div class="hint mono" *ngIf="c.ip">{{ c.ip }}</div></td>
                                     <td><span class="score-pill" [ngClass]="scoreClass(c.riskScore)">{{ c.riskScore }}</span></td>
                                     <td class="signals-cell">
@@ -681,7 +698,7 @@ type Tab = 'overview' | 'rules' | 'review' | 'lists' | 'simulate' | 'lookup' | '
                         <div class="sim-grid">
                             <div><label>Email</label><input class="form-input" [(ngModel)]="sim.email" placeholder="test@example.com"></div>
                             <div><label>IP address</label><input class="form-input mono" [(ngModel)]="sim.ip" placeholder="203.0.113.42"></div>
-                            <div><label>Order value <small>(£)</small></label><input class="form-input" type="number" min="0" [(ngModel)]="sim.valueGbp"></div>
+                            <div><label>Order value <small>({{ ccy }})</small></label><input class="form-input" type="number" min="0" [(ngModel)]="sim.valueGbp"></div>
                             <div><label>Country <small>(optional)</small></label><input class="form-input" [(ngModel)]="sim.country" placeholder="GB" maxlength="2" style="text-transform:uppercase"></div>
                             <div><label>Billing postcode <small>(optional)</small></label><input class="form-input" [(ngModel)]="sim.billingPostcode" placeholder="SW1A 1AA"></div>
                             <div><label>Shipping postcode <small>(optional)</small></label><input class="form-input" [(ngModel)]="sim.shippingPostcode" placeholder="SW1A 1AA"></div>
@@ -750,7 +767,7 @@ type Tab = 'overview' | 'rules' | 'review' | 'lists' | 'simulate' | 'lookup' | '
                             </div>
                             <div class="kpi-row" style="margin:14px 0">
                                 <div class="kpi"><div class="kpi-label">Orders</div><div class="kpi-num">{{ profile.totals?.orders || 0 }}</div><div class="kpi-sub">{{ profile.totals?.settled || 0 }} settled · {{ profile.totals?.cancelled || 0 }} cancelled</div></div>
-                                <div class="kpi"><div class="kpi-label">Lifetime value</div><div class="kpi-num">£{{ ((profile.totals?.lifetimeValue || 0) / 100) | number:'1.0-0' }}</div><div class="kpi-sub" *ngIf="profile.totals?.firstOrder">since {{ profile.totals.firstOrder | date:'MMM y' }}</div></div>
+                                <div class="kpi"><div class="kpi-label">Lifetime value</div><div class="kpi-num">{{ ((profile.totals?.lifetimeValue || 0) / 100) | currency:ccy:'symbol':'1.0-0' }}</div><div class="kpi-sub" *ngIf="profile.totals?.firstOrder">since {{ profile.totals.firstOrder | date:'MMM y' }}</div></div>
                                 <div class="kpi" [class.kpi-alert]="profile.failedPayments > 0"><div class="kpi-label">Failed payments</div><div class="kpi-num">{{ profile.failedPayments }}</div><div class="kpi-sub">all time</div></div>
                                 <div class="kpi" [class.kpi-alert]="profile.cases?.length > 0"><div class="kpi-label">Fraud cases</div><div class="kpi-num">{{ profile.cases?.length || 0 }}</div><div class="kpi-sub">most recent 10</div></div>
                             </div>
@@ -764,7 +781,7 @@ type Tab = 'overview' | 'rules' | 'review' | 'lists' | 'simulate' | 'lookup' | '
                                 <tbody>
                                     <tr *ngFor="let o of profile.recentOrders">
                                         <td><strong>{{ o.code }}</strong></td><td>{{ o.state }}</td>
-                                        <td class="num-col">£{{ (o.subTotalWithTax / 100).toFixed(2) }}</td>
+                                        <td class="num-col">{{ (o.subTotalWithTax / 100) | currency:ccy }}</td>
                                         <td class="mono hint">{{ o.ip || '—' }}</td>
                                         <td class="hint">{{ o.orderPlacedAt | date:'d MMM y HH:mm' }}</td>
                                     </tr>
@@ -808,6 +825,8 @@ type Tab = 'overview' | 'rules' | 'review' | 'lists' | 'simulate' | 'lookup' | '
                                     <option value="allow">allow</option><option value="flag">flag</option>
                                     <option value="review">review</option><option value="block">block</option>
                                     <option value="approved">approved</option><option value="rejected">rejected</option>
+                                    <option value="refused">refused before payment</option><option value="unpaid">unpaid</option>
+                                    <option value="shadow">shadow (protection off)</option>
                                 </select>
                                 <span class="mode-seg" title="Only assessments where the card issuer reported an AVS postcode or street-address mismatch">
                                     <button class="seg seg-avs" [class.active]="logSignal === 'avs'" (click)="logSignal = logSignal === 'avs' ? '' : 'avs'; loadLog()">
@@ -844,7 +863,8 @@ type Tab = 'overview' | 'rules' | 'review' | 'lists' | 'simulate' | 'lookup' | '
                 <div class="card">
                     <div class="card-block">
                         <h3 class="step-title">Notifications</h3>
-                        <p class="hint">Where alerts go when an order is held, approved or rejected. Connect as many channels as you like — every event pings all of them.</p>
+                        <p class="hint">Where alerts go when an order is held, refused, flagged, approved or rejected. Connect as many channels as you like — every event pings all of them.</p>
+                        <p class="hint warn-inline" *ngIf="premiumLocked">E-mail and chat alerts need a licence or the evaluation: settings are kept, but nothing is sent on the free tier.</p>
                         <div class="integrations" *ngIf="notif">
                             <div class="integ-row" *ngFor="let ch of integrations">
                                 <button class="integ-head" (click)="integOpen = integOpen === ch.key ? '' : ch.key" [attr.aria-expanded]="integOpen === ch.key">
@@ -863,8 +883,8 @@ type Tab = 'overview' | 'rules' | 'review' | 'lists' | 'simulate' | 'lookup' | '
                                                 <label>Send alerts to</label>
                                                 <input class="form-input" [(ngModel)]="notif.adminEmail" (ngModelChange)="notifDirty = true" placeholder="you@company.com">
                                             </div>
-                                            <label class="check-label"><input type="checkbox" [(ngModel)]="notif.notifyOnBlocked" (ngModelChange)="notifDirty = true"> Alert me on blocked-level holds</label>
-                                            <label class="check-label"><input type="checkbox" [(ngModel)]="notif.notifyOnHighRisk" (ngModelChange)="notifDirty = true"> Alert me on review-level holds</label>
+                                            <label class="check-label"><input type="checkbox" [(ngModel)]="notif.notifyOnBlocked" (ngModelChange)="notifDirty = true"> Alert me on blocked-level holds and orders refused before payment</label>
+                                            <label class="check-label"><input type="checkbox" [(ngModel)]="notif.notifyOnHighRisk" (ngModelChange)="notifDirty = true"> Alert me on review-level holds and risky orders flagged in monitor / hold mode</label>
                                             <label class="check-label"><input type="checkbox" [(ngModel)]="notif.notifyOnApproval" (ngModelChange)="notifDirty = true"> Email the customer when I approve their order</label>
                                             <label class="check-label"><input type="checkbox" [(ngModel)]="notif.notifyOnRejection" (ngModelChange)="notifDirty = true"> Email the customer when I reject their order</label>
                                             <label class="check-label"><input type="checkbox" [(ngModel)]="notif.blocklistOnReject" (ngModelChange)="notifDirty = true"> Silently blocklist the email + IP whenever I reject (no tip-off)</label>
@@ -998,10 +1018,37 @@ type Tab = 'overview' | 'rules' | 'review' | 'lists' | 'simulate' | 'lookup' | '
                 </div>
             </vdr-page-block>
             <vdr-page-block>
+                <div class="card" *ngIf="general">
+                    <div class="card-block">
+                        <h3 class="step-title">IP intelligence</h3>
+                        <p class="hint">Optional VPN / proxy / hosting detection and the IP-country vs billing-country check, from <strong>ip-api.com Pro</strong> over HTTPS with your own key. Off by default: nothing is sent anywhere until you switch it on and add a key. Private and reserved addresses are never looked up; answers are cached 30 days per address. The free ip-api.com endpoint is never used (it does not allow commercial use).</p>
+                        <label class="check-label"><input type="checkbox" [(ngModel)]="general.ipIntelEnabled" (ngModelChange)="generalDirty = true"> Look up IP intelligence for scored orders</label>
+                        <div class="form-row" style="margin-top:10px;max-width:420px">
+                            <label>ip-api.com Pro key <small *ngIf="general.ipIntelKeySet">(saved {{ general.ipIntelKeyHint }})</small></label>
+                            <input class="form-input" type="password" autocomplete="off" [(ngModel)]="ipIntelKeyInput" (ngModelChange)="generalDirty = true"
+                                   [disabled]="general.ipIntelKeyFromOptions"
+                                   [placeholder]="general.ipIntelKeyFromOptions ? 'Set by the ipApiKey plugin option' : (general.ipIntelKeySet ? 'Leave empty to keep the saved key' : 'Paste your key')">
+                        </div>
+                        <p class="hint warn-inline" *ngIf="general.ipIntelEnabled && !general.ipIntelKeySet && !ipIntelKeyInput">Switched on but no key yet — no lookups happen until a key is saved.</p>
+                        <h3 class="step-title" style="margin-top:16px">Activity log retention</h3>
+                        <div class="form-row" style="max-width:240px">
+                            <label>Keep activity for <small>(days, 0 = forever)</small></label>
+                            <input class="form-input" type="number" min="0" max="3650" [(ngModel)]="general.logRetentionDays" (ngModelChange)="generalDirty = true">
+                        </div>
+                        <p class="hint">Older rows are removed nightly at 04:00.</p>
+                        <div class="picker">
+                            <button class="gbtn gbtn-primary gbtn-sm" (click)="saveGeneral()" [disabled]="!generalDirty || generalBusy">{{ generalBusy ? 'Saving…' : 'Save' }}</button>
+                            <button class="gbtn gbtn-ghost gbtn-sm" *ngIf="general.ipIntelKeySet && !general.ipIntelKeyFromOptions" (click)="saveGeneral(true)" [disabled]="generalBusy">Remove saved key</button>
+                        </div>
+                    </div>
+                </div>
+            </vdr-page-block>
+            <vdr-page-block>
                 <div class="card">
                     <div class="card-block">
                         <h3 class="step-title">Weekly report</h3>
                         <p class="hint">Every Monday at 08:00 (server time) Fraud Prevention emails a short report: orders scored, held and blocked, the value intercepted, review decisions, and the next set-up steps. Needs SMTP on the server (the same transport as the alerts).</p>
+                        <p class="hint warn-inline" *ngIf="digest && digest.premium === false">The weekly report needs a licence or the evaluation. It is not sent on the free tier; your settings are kept and it resumes with a licence.</p>
                         <ng-container *ngIf="digest; else digestUnavailable">
                             <label class="check-label"><input type="checkbox" [(ngModel)]="digest.enabled" (ngModelChange)="saveDigest({ enabled: $event })"> Send the weekly report</label>
                             <div class="form-row" style="margin-top:10px;max-width:420px">
@@ -1015,8 +1062,8 @@ type Tab = 'overview' | 'rules' | 'review' | 'lists' | 'simulate' | 'lookup' | '
                             </p>
                             <div class="picker">
                                 <button class="gbtn gbtn-primary gbtn-sm" (click)="saveDigest({ recipient: digestRecipient })" [disabled]="digestBusy || digestRecipient === (digest.recipient || '')">Save recipient</button>
-                                <button class="gbtn gbtn-outline gbtn-sm" (click)="sendDigestTest()" [disabled]="digestBusy">{{ digestBusy ? 'Sending…' : 'Send me a test' }}</button>
-                                <button class="gbtn gbtn-outline gbtn-sm" (click)="previewDigest()" [disabled]="digestBusy">Preview</button>
+                                <button class="gbtn gbtn-outline gbtn-sm" (click)="sendDigestTest()" [disabled]="digestBusy || digest.premium === false">{{ digestBusy ? 'Sending…' : 'Send me a test' }}</button>
+                                <button class="gbtn gbtn-outline gbtn-sm" (click)="previewDigest()" [disabled]="digestBusy || digest.premium === false">Preview</button>
                             </div>
                         </ng-container>
                         <ng-template #digestUnavailable><p class="hint">{{ digestLoadFailed ? 'The weekly report is not available on this server.' : 'Loading…' }}</p></ng-template>
@@ -1032,7 +1079,7 @@ type Tab = 'overview' | 'rules' | 'review' | 'lists' | 'simulate' | 'lookup' | '
                             Licence: <strong>{{ meta.licensed ? '✓ active' : 'free tier' }}</strong>
                             <span *ngIf="!meta.licensed"> — {{ meta.licenceMessage }}</span>
                         </p>
-                        <p class="hint">Audit log retention: 180 days (configurable via plugin options). Threat feeds refresh daily at 03:00.</p>
+                        <p class="hint">Threat feeds refresh daily at 03:00.</p>
                     </div>
                 </div>
             </vdr-page-block>
@@ -1525,8 +1572,12 @@ export class FraudPreventionComponent implements OnInit {
     modes = [
         { key: 'off' as const, label: 'Off' },
         { key: 'monitor' as const, label: 'Monitor' },
+        { key: 'hold' as const, label: 'Hold' },
         { key: 'enforce' as const, label: 'Enforce' },
     ];
+
+    /** Currency of the channel being edited (value limits, amounts). */
+    get ccy(): string { return this.current?.currencyCode || this.configs[0]?.currencyCode || 'GBP'; }
 
     stats: any = null;
     statsDays = 7;
@@ -1679,7 +1730,7 @@ export class FraudPreventionComponent implements OnInit {
     }
 
     // ── Weekly report (Settings) ─────────────────────────────────────
-    digest: { enabled: boolean; recipient: string | null; defaultRecipient: string | null; lastSentAt: string | null; nextDueAt: string | null } | null = null;
+    digest: { enabled: boolean; recipient: string | null; defaultRecipient: string | null; lastSentAt: string | null; nextDueAt: string | null; premium?: boolean } | null = null;
     digestRecipient = '';
     digestBusy = false;
     digestLoadFailed = false;
@@ -1857,16 +1908,63 @@ export class FraudPreventionComponent implements OnInit {
         if (tab === 'review') this.loadCases();
         if (tab === 'lists') this.loadLists();
         if (tab === 'activity') this.loadLog();
-        if (tab === 'settings') { this.loadNotif(); this.loadTemplates(); this.loadDigest(); }
+        if (tab === 'settings') { this.loadNotif(); this.loadTemplates(); this.loadDigest(); this.loadGeneral(); }
+        if (tab === 'overview') this.loadProxyHint();
+    }
+
+    // ── Install-wide settings (IP intelligence, retention) ──────────
+    general: { ipIntelEnabled: boolean; ipIntelKeySet: boolean; ipIntelKeyHint: string | null; ipIntelKeyFromOptions: boolean; logRetentionDays: number } | null = null;
+    ipIntelKeyInput = '';
+    generalDirty = false;
+    generalBusy = false;
+
+    loadGeneral() {
+        this.http.get<any>('/fraud-prevention/settings').subscribe({
+            next: g => { this.general = g; this.generalDirty = false; this.ipIntelKeyInput = ''; this.cdr.markForCheck(); },
+            error: () => undefined,
+        });
+    }
+
+    saveGeneral(removeKey = false) {
+        if (!this.general) return;
+        const body: any = { ipIntelEnabled: !!this.general.ipIntelEnabled, logRetentionDays: Number(this.general.logRetentionDays) || 0 };
+        if (removeKey) body.ipIntelKey = '';
+        else if (this.ipIntelKeyInput.trim()) body.ipIntelKey = this.ipIntelKeyInput.trim();
+        this.generalBusy = true;
+        this.http.post<any>('/fraud-prevention/settings', body).subscribe({
+            next: g => {
+                this.generalBusy = false; this.general = g; this.generalDirty = false; this.ipIntelKeyInput = '';
+                this.notification.success('Settings saved');
+                this.cdr.markForCheck();
+            },
+            error: e => { this.generalBusy = false; this.notification.error(e?.error?.message || 'Could not save the settings'); this.cdr.markForCheck(); },
+        });
+    }
+
+    // ── Misconfigured-proxy notice (Overview) ────────────────────────
+    proxyHint: { peers: string[]; header: string; clients: number } | null = null;
+
+    loadProxyHint() {
+        this.http.get<any>('/fraud-prevention/proxy-hint').subscribe({
+            next: r => { this.proxyHint = r?.hint || null; this.cdr.markForCheck(); },
+            error: () => undefined,
+        });
+    }
+
+    dismissProxyHint() {
+        this.http.post<any>('/fraud-prevention/proxy-hint/dismiss', {}).subscribe({
+            next: () => { this.proxyHint = null; this.cdr.markForCheck(); },
+            error: () => this.notification.error('Could not dismiss the notice'),
+        });
     }
 
     // ── Config ─────────────────────────────────────────────────────
     markDirty() { this.dirty = true; }
 
-    setMode(mode: 'off' | 'monitor' | 'enforce') {
+    setMode(mode: 'off' | 'monitor' | 'hold' | 'enforce') {
         if (!this.current) return;
         if (mode === 'enforce' && this.premiumLocked) {
-            this.notification.warning('Enforce mode needs a licence — start the free trial or activate a key at the top of this page. Running in monitor until then.');
+            this.notification.warning('Enforce mode needs a licence — start the free trial or activate a key at the top of this page. It works as Hold until then.');
         }
         this.current.mode = mode;
         this.markDirty();
@@ -1875,10 +1973,14 @@ export class FraudPreventionComponent implements OnInit {
     statusSentence(): string {
         const c = this.current;
         if (!c) return '';
-        if (c.mode === 'off') return 'Fraud prevention is OFF for this channel — orders are not scored or logged.';
+        if (c.mode === 'off') return 'Fraud prevention is OFF for this channel — orders are scored in the background (shadow) but nothing is held or refused.';
         const thresholds = `review at ${c.reviewThreshold}, block at ${c.blockThreshold}`;
         if (c.mode === 'monitor') {
-            return `Monitoring: every order is scored and logged (${thresholds}) but nothing is ever held. Watch Activity, then switch to Enforce when the thresholds look right.`;
+            return `Monitoring: every order is scored and logged (${thresholds}) but nothing is ever held. Watch Activity, then switch to Hold or Enforce when the thresholds look right.`;
+        }
+        if (c.mode === 'hold' || (c.mode === 'enforce' && this.premiumLocked)) {
+            return `Holding: orders scoring ≥ ${c.blockThreshold} are refused before the customer is charged; riskier-than-${c.reviewThreshold} paid orders are flagged in Activity.` +
+                (c.mode === 'enforce' ? ' (Enforce works as Hold until a licence is active.)' : '');
         }
         const hold = c.holdFulfilment ? 'licence keys wait for your approval' : 'fulfilment is NOT held (holds disabled)';
         return `Enforcing: orders scoring ≥ ${c.reviewThreshold} are held for review and ${hold}. Orders ≥ ${c.blockThreshold} also tell the customer their order is being verified.`;
