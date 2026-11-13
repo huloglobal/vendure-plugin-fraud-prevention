@@ -13,6 +13,7 @@ import { FraudPreventionController } from './fraud-prevention.controller';
 import { FraudOrderGuard } from './order-guard';
 import { FraudCrons } from './crons';
 import { FraudPreventionPluginOptions } from './types';
+import { fraudPreChargeProcess } from './order-process';
 
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const PKG_VERSION: string = require('../package.json').version;
@@ -33,10 +34,12 @@ const REVOCATION_URL = process.env.HULO_LICENCE_REVOCATION_URL
     || 'https://elite.charity/licence/revoked.json';
 
 export interface FraudPluginInitOptions extends FraudPreventionPluginOptions {
-    /** JWT licence key from huloglobal.com. Without a valid licence the
-     *  plugin runs in the FREE tier: monitor mode + manual lists +
-     *  simulate. `enforce` mode, threat-feed sync, email alerts and
-     *  custom signal weights require a licence. */
+    /** JWT licence key from huloglobal.com. Without a valid licence (or
+     *  the 14-day evaluation) the plugin runs in the FREE tier: scoring,
+     *  monitor and hold mode (block-level orders refused before the
+     *  charge), manual lists, custom weights, simulate, lookup. Enforce
+     *  mode (review queue), threat feeds, e-mail/chat alerts, the HTTP
+     *  fulfilment gate and the weekly report need premium. */
     licenceKey?: string;
 }
 
@@ -59,6 +62,12 @@ export function getOptions(): FraudPluginInitOptions { return cachedOptions; }
     imports: [PluginCommonModule],
     controllers: [FraudPreventionController],
     providers: [FraudPreventionService, FraudOrderGuard, FraudCrons],
+    // Hold mode's pre-charge check: runs on the move to ArrangingPayment, fails open.
+    configuration: config => {
+        const process = config.orderOptions.process || [];
+        if (!process.includes(fraudPreChargeProcess as any)) config.orderOptions.process = [...process, fraudPreChargeProcess as any];
+        return config;
+    },
     compatibility: '^3.0.0',
 })
 export class FraudPreventionPlugin {
@@ -128,6 +137,8 @@ export class FraudPreventionPlugin {
         // Anonymous 30-day aggregates (numbers only) for the evaluation reminder emails
         // and, after purchase, the daily heartbeat — so renewal and win-back emails can
         // say what the plugin did for the store.
+        // The init() options reach the service here (avsResolver, smtp, cancel/refund on reject, …).
+        service.setOptions(cachedOptions);
         FraudPreventionPlugin.statsProvider = () => service.evalStats();
         FraudPreventionPlugin.evalClientInternal?.setStatsProvider(FraudPreventionPlugin.statsProvider);
         FraudPreventionPlugin.heartbeat?.setStatsProvider(FraudPreventionPlugin.statsProvider);
@@ -202,8 +213,8 @@ export class FraudPreventionPlugin {
             // eslint-disable-next-line no-console
             console.warn(
                 `[${PKG_NAME}] ${status.message}` +
-                ` — Running in FREE tier: monitor mode, manual lists and simulate only.` +
-                ` Enforce mode, review-queue holds, threat-feed sync and email alerts` +
+                ` — Running in FREE tier: scoring, monitor and hold mode, manual lists, weights and simulate.` +
+                ` Enforce mode (review queue), threat-feed sync, e-mail/chat alerts and the weekly report` +
                 ` require a licence: https://huloglobal.com/vendure-plugins/fraud-prevention/`,
             );
         }

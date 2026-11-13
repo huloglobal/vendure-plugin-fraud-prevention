@@ -71,13 +71,19 @@ describe('avsFromStripeCharge', () => {
         const r = avsFromStripeCharge({
             payment_method_details: { card: { checks: { address_line1_check: 'pass', address_postal_code_check: 'fail', cvc_check: 'pass' } } },
         });
-        expect(r).toEqual({ source: 'stripe', postalCode: 'fail', line1: 'pass' });
+        expect(r).toEqual({ source: 'stripe', postalCode: 'fail', line1: 'pass', cvc: 'pass' });
+    });
+    it('reads the CVC verdict and the card country', () => {
+        const r = avsFromStripeCharge({
+            payment_method_details: { card: { country: 'us', checks: { cvc_check: 'fail', address_line1_check: null, address_postal_code_check: null } } },
+        });
+        expect(r).toEqual({ source: 'stripe', cvc: 'fail', cardCountry: 'US' });
     });
     it('returns null when checks are absent or all null (non-card or not checked)', () => {
         expect(avsFromStripeCharge(null)).toBeNull();
         expect(avsFromStripeCharge({})).toBeNull();
         expect(avsFromStripeCharge({ payment_method_details: { paypal: {} } })).toBeNull();
-        expect(avsFromStripeCharge({ payment_method_details: { card: { checks: { address_line1_check: null, address_postal_code_check: null, cvc_check: 'pass' } } } })).toBeNull();
+        expect(avsFromStripeCharge({ payment_method_details: { card: { checks: { address_line1_check: null, address_postal_code_check: null, cvc_check: null } } } })).toBeNull();
     });
     it('omits the check that was null but keeps the other', () => {
         const r = avsFromStripeCharge({ payment_method_details: { card: { checks: { address_line1_check: null, address_postal_code_check: 'pass' } } } });
@@ -287,5 +293,13 @@ describe('describeAvs', () => {
             .toBe('Card issuer reports the billing postcode does not match the card (stripe)');
         expect(describeAvs('line1', { line1: 'fail' }))
             .toBe('Card issuer reports the street address does not match the card');
+    });
+});
+
+describe('card checks from payment metadata: CVC and card country', () => {
+    it('reads cvc and cardCountry from the canonical and Stripe-shaped keys', () => {
+        expect(avsFromMetadata({ avs: { cvc: 'fail', cardCountry: 'de' } })).toMatchObject({ cvc: 'fail', cardCountry: 'DE' });
+        expect(avsFromMetadata({ checks: { cvc_check: 'fail' }, card: { country: 'FR' } })).toMatchObject({ cvc: 'fail', cardCountry: 'FR' });
+        expect(avsFromMetadata({ card: { country: 'not-a-country' } })).toBeNull();
     });
 });

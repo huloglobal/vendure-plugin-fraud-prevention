@@ -1,6 +1,7 @@
-import * as http from 'http';
+import * as https from 'https';
 import { isIP } from 'net';
 import { Logger } from '@vendure/core';
+import { isPublicIp } from './net-util';
 
 const loggerCtx = 'FraudPrevention';
 
@@ -14,10 +15,12 @@ export interface IpIntel {
 }
 
 /**
- * IP intelligence via ip-api.com (free tier: HTTP only, 45 req/min).
- * Results are cached by the service in `fraud_ip_intel` for 30 days, so
- * the rate limit only matters for genuinely new IPs. Lookups fail OPEN:
- * a timeout or rate-limit never adds points and never blocks an order.
+ * IP intelligence from ip-api.com **Pro** over HTTPS with the merchant's own
+ * key. Opt-in: nothing is looked up unless IP intelligence is switched on
+ * and a key is set (the free ip-api.com endpoint forbids commercial use and
+ * is never called). Private, loopback and reserved addresses are never sent.
+ * Results are cached by the service in `fraud_ip_intel` for 30 days. Lookups
+ * fail OPEN: a timeout or error never adds points and never blocks an order.
  */
 const negativeCache = new Map<string, number>();
 const NEGATIVE_TTL = 15 * 60 * 1000;
@@ -35,45 +38,62 @@ function takeToken(): boolean {
 /** Test hook. */
 export function _resetIpIntelState() { negativeCache.clear(); tokens = 40; lastRefill = Date.now(); }
 
-export function lookupIpIntel(ip: string, timeoutMs = 2500): Promise<IpIntel> {
-    const empty: IpIntel = { ip, countryCode: null, isVpnOrProxy: false, isHosting: false, resolved: false };
-    if (!isIP(ip)) return Promise.resolve(empty);
-    // A lookup that failed (timeout, rate limit, bad answer) is remembered for a while so a wave of
-    // orders from new addresses does not pay the full timeout each, and ip-api's 45/min is respected.
-    const neg = negativeCache.get(ip);
-    if (neg && Date.now() - neg < NEGATIVE_TTL) return Promise.resolve(empty);
-    if (!takeToken()) return Promise.resolve(empty);
-    return new Promise(resolve => {
-        const req = http.get(
-            `http://ip-api.com/json/${ip}?fields=status,countryCode,proxy,hosting`,
-            { timeout: timeoutMs },
-            res => {
-                let data = '';
-                res.on('data', c => (data += c));
-                res.on('end', () => {
-                    try {
-                        const j = JSON.parse(data);
-                        if (j.status !== 'success') { negativeCache.set(ip, Date.now()); return resolve(empty); }
-                        resolve({
-                            ip,
-                            countryCode: j.countryCode || null,
-                            isVpnOrProxy: !!j.proxy,
-                            isHosting: !!j.hosting,
-                            resolved: true,
-                        });
-                    } catch {
-                        resolve(empty);
-                    }
-                });
-            },
-        );
-        req.on('error', e => {
-            Logger.debug(`ip-intel lookup failed for ${ip}: ${e.message}`, loggerCtx);
-            negativeCache.set(ip, Date.now());
-            resolve(empty);
+export interface IpIntelLookupOptions {
+    /** ip-api.com Pro key; empty = no lookup. */
+    apiKey?: string | null;
+    timeoutMs?: number;
+    /** Test hook: replaces the HTTPS GET. Resolves with the response body. */
+    get?: (url: string, timeoutMs: number) => Promise<string>;
+}
+
+/** The request URL (exported for tests). The key travels as a query
+ *  parameter, as ip-api.com Pro requires; it is never logged. */
+export function ipApiUrl(ip: string, apiKey: string): string {
+    return `https://pro.ip-api.com/json/${encodeURIComponent(ip)}?fields=status,countryCode,proxy,hosting&key=${encodeURIComponent(apiKey)}`;
+}
+
+function httpsGet(url: string, timeoutMs: number): Promise<string> {
+    return new Promise((resolve, reject) => {
+        const req = https.get(url, { timeout: timeoutMs }, res => {
+            if ((res.statusCode || 0) !== 200) { res.resume(); reject(new Error(`HTTP ${res.statusCode}`)); return; }
+            let data = '';
+            res.setEncoding('utf8');
+            res.on('data', c => { data += c; if (data.length > 64_000) req.destroy(new Error('response too large')); });
+            res.on('end', () => resolve(data));
         });
-        req.on('timeout', () => { req.destroy(); negativeCache.set(ip, Date.now()); resolve(empty); });
+        req.on('error', reject);
+        req.on('timeout', () => req.destroy(new Error('timeout')));
     });
+}
+
+export async function lookupIpIntel(ip: string, opts: IpIntelLookupOptions = {}): Promise<IpIntel> {
+    const empty: IpIntel = { ip, countryCode: null, isVpnOrProxy: false, isHosting: false, resolved: false };
+    const key = String(opts.apiKey || '').trim();
+    if (!key || !isIP(ip) || !isPublicIp(ip)) return empty;
+    // A lookup that failed (timeout, rate limit, bad answer) is remembered for a while so a wave
+    // of orders from new addresses does not pay the full timeout each.
+    const neg = negativeCache.get(ip);
+    if (neg && Date.now() - neg < NEGATIVE_TTL) return empty;
+    if (!takeToken()) return empty;
+    const timeoutMs = opts.timeoutMs ?? 2500;
+    try {
+        const body = await (opts.get ?? httpsGet)(ipApiUrl(ip, key), timeoutMs);
+        const j = JSON.parse(body);
+        if (j?.status !== 'success') { negativeCache.set(ip, Date.now()); return empty; }
+        return {
+            ip,
+            countryCode: typeof j.countryCode === 'string' && j.countryCode ? j.countryCode : null,
+            isVpnOrProxy: !!j.proxy,
+            isHosting: !!j.hosting,
+            resolved: true,
+        };
+    } catch (e: any) {
+        // The message never includes the URL (and so never the key).
+        Logger.debug(`ip-intel lookup failed for ${ip}: ${e?.message || e}`, loggerCtx);
+        negativeCache.set(ip, Date.now());
+        if (negativeCache.size > 10_000) negativeCache.delete(negativeCache.keys().next().value as string);
+        return empty;
+    }
 }
 
 // ── Email MX validation ─────────────────────────────────────────────

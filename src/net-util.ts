@@ -208,3 +208,44 @@ export function normalizeEmail(raw: string): NormalizedEmail | null {
     if (DOT_INSENSITIVE_DOMAINS.has(domain)) local = local.replace(/\./g, '');
     return { email, domain, canonical: `${local}@${domain}`, usedPlusAddressing };
 }
+
+/** Ranges that never identify a customer on the public internet: private,
+ *  loopback, link-local, carrier-grade NAT, documentation, benchmarking,
+ *  multicast and reserved space (IPv4 and IPv6). */
+const NON_PUBLIC_RANGES = [
+    '0.0.0.0/8', '10.0.0.0/8', '100.64.0.0/10', '127.0.0.0/8', '169.254.0.0/16', '172.16.0.0/12',
+    '192.0.0.0/24', '192.0.2.0/24', '192.168.0.0/16', '198.18.0.0/15', '198.51.100.0/24', '203.0.113.0/24',
+    '224.0.0.0/4', '240.0.0.0/4',
+    '::/127', '100::/64', '2001:db8::/32', 'fc00::/7', 'fe80::/10', 'ff00::/8',
+];
+
+/** A syntactically valid address that is routable on the public internet. */
+export function isPublicIp(raw: unknown): boolean {
+    const ip = cleanIp(raw);
+    if (!ip) return false;
+    return !NON_PUBLIC_RANGES.some(r => ipInCidr(ip, r));
+}
+
+/**
+ * Forwarding headers a request carried that were NOT believed: the peer is
+ * not a configured trusted proxy (or none are configured and Express did not
+ * apply them either), yet it named a different public client. Behind such a
+ * peer every customer is scored with the proxy's own address, so velocity
+ * and list signals lump all of them together. Returns null when nothing was
+ * ignored.
+ */
+export function ignoredForwarding(req: ClientIpRequest, opts: ClientIpOptions = {}): { peer: string; header: string; client: string } | null {
+    const peer = cleanIp(req.socket?.remoteAddress);
+    if (!peer) return null;
+    const resolved = clientIpFromRequest(req, opts);
+    if (resolved && resolved !== peer) return null; // the headers were applied (trusted proxy or Express trust proxy)
+    for (const name of ['cf-connecting-ip', 'x-forwarded-for', 'x-real-ip']) {
+        const raw = header(req, name);
+        if (!raw) continue;
+        const hops = raw.split(',').map(s => s.trim()).filter(Boolean);
+        const client = cleanIp(hops[hops.length - 1]);
+        if (client && client !== peer && isPublicIp(client)) return { peer, header: name, client };
+        return null;
+    }
+    return null;
+}

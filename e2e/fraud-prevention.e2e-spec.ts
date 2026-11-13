@@ -5,6 +5,7 @@ import { initialData } from '../../../e2e-shared/initial-data';
 import { FraudPreventionPlugin } from '../src/plugin';
 import { FraudPreventionService } from '../src/fraud-prevention.service';
 import { FraudPreventionController } from '../src/fraud-prevention.controller';
+import { formatMinor } from '../src/money';
 import { RateLimiter } from '@huloglobal/vendure-licence-sdk';
 
 /** A card-like handler: settles immediately, supports full refunds and
@@ -20,6 +21,17 @@ const e2ePaymentHandler = new PaymentMethodHandler({
     settlePayment: async () => ({ success: true }),
     cancelPayment: async () => ({ success: true }),
     createRefund: async (ctx, input, amount) => ({ state: 'Settled' as const, transactionId: `rf-${Date.now()}` }),
+});
+
+/** A manual-capture card: the payment stays Authorized until settled (approve captures it). */
+const settledByE2e: string[] = [];
+const e2eAuthHandler = new PaymentMethodHandler({
+    code: 'fp-e2e-auth',
+    description: [{ languageCode: LanguageCode.en, value: 'E2E authorise-only payment' }],
+    args: {},
+    createPayment: async (ctx, order, amount) => ({ amount, state: 'Authorized' as const, transactionId: `auth-${order.code}`, metadata: {} }),
+    settlePayment: async (ctx, order, payment) => { settledByE2e.push(order.code); return { success: true }; },
+    cancelPayment: async () => ({ success: true }),
 });
 
 /**
@@ -65,7 +77,7 @@ run('@huloglobal/vendure-plugin-fraud-prevention (MariaDB)', () => {
         customFields: {
             Order: [{ name: 'ip', type: 'string' as const, nullable: true }],
         },
-        paymentOptions: { paymentMethodHandlers: [e2ePaymentHandler] },
+        paymentOptions: { paymentMethodHandlers: [e2ePaymentHandler, e2eAuthHandler] },
         plugins: [
             FraudPreventionPlugin.init({ publicBaseUrl: BASE, defaultAdminEmail: 'ops@test.local', rateLimit: { capacity: 25, windowMs: 60_000 } }),
         ],
@@ -283,7 +295,7 @@ run('@huloglobal/vendure-plugin-fraud-prevention (MariaDB)', () => {
         expect(a.score).toBeGreaterThanOrEqual(0);
     });
 
-    it('never enforces without a licence — a blocklisted order flags, not blocks', async () => {
+    it('never enforces without a licence — enforce falls back to the free hold mode', async () => {
         await svc().addEntry('blocklist', 'email', 'fraudster@evil.test', 'e2e');
         await svc().saveConfig({
             ...(await svc().getConfig(1)),
@@ -294,8 +306,8 @@ run('@huloglobal/vendure-plugin-fraud-prevention (MariaDB)', () => {
             orderValuePence: 2000, dryRun: true,
         });
         expect(a.signals.some(s => s.key === 'blocklist_email')).toBe(true);
-        expect(a.mode).toBe('monitor'); // licence gate downgraded enforce -> monitor
-        expect(a.action).toBe('flag');  // flagged, never blocked, in free tier
+        expect(a.mode).toBe('hold');    // licence gate: enforce -> hold (never weaker than the free tier)
+        expect(a.action).toBe('hold');  // no review case; block level is refused before the charge
     });
 
     it('allowlist bypasses every check', async () => {
@@ -485,7 +497,8 @@ run('@huloglobal/vendure-plugin-fraud-prevention (MariaDB)', () => {
     });
 
     // ── Reject → cancel + refund through Vendure ───────────────────────
-    async function placeOrder(email: string): Promise<{ id: string; code: string; total: number }> {
+    /** Everything up to the move to ArrangingPayment; returns that transition's result. */
+    async function checkoutToArrangingPayment(email: string): Promise<any> {
         await adminClient.asSuperAdmin();
         // One-off catalogue: tax category, product + variant, shipping and
         // payment methods (idempotent via code lookups).
@@ -518,14 +531,17 @@ run('@huloglobal/vendure-plugin-fraud-prevention (MariaDB)', () => {
             shippingId = createShippingMethod.id;
         }
         const { paymentMethods } = await adminClient.query(gql`{ paymentMethods { items { id code } } }`);
-        if (!paymentMethods.items.some((m: any) => m.code === 'fp-e2e-pay')) {
-            await adminClient.query(gql`mutation {
-                createPaymentMethod(input: { code: "fp-e2e-pay", enabled: true, translations: [{ languageCode: en, name: "E2E card" }], handler: { code: "fp-e2e-pay", arguments: [] } }) { id }
-            }`);
+        for (const code of ['fp-e2e-pay', 'fp-e2e-auth']) {
+            if (!paymentMethods.items.some((m: any) => m.code === code)) {
+                await adminClient.query(gql`mutation ($code: String!) {
+                    createPaymentMethod(input: { code: $code, enabled: true, translations: [{ languageCode: en, name: "E2E card" }], handler: { code: $code, arguments: [] } }) { id }
+                }`, { code });
+            }
         }
 
         // Guest checkout on a fresh session.
         (shopClient as any).authToken = undefined;
+        delete (shopClient as any).headers.Authorization;
         const add = await shopClient.query(gql`mutation ($id: ID!) {
             addItemToOrder(productVariantId: $id, quantity: 1) { ... on Order { id code } ... on ErrorResult { errorCode message } }
         }`, { id: variantId });
@@ -542,13 +558,18 @@ run('@huloglobal/vendure-plugin-fraud-prevention (MariaDB)', () => {
         }`, { id: [shippingId] });
         expect(ship.setOrderShippingMethod.id).toBeTruthy();
         const trans = await shopClient.query(gql`mutation {
-            transitionOrderToState(state: "ArrangingPayment") { ... on Order { id state } ... on ErrorResult { errorCode message } }
+            transitionOrderToState(state: "ArrangingPayment") { ... on Order { id code state } ... on ErrorResult { errorCode message } ... on OrderStateTransitionError { transitionError } }
         }`);
-        expect(trans.transitionOrderToState.state).toBe('ArrangingPayment');
-        const paid = await shopClient.query(gql`mutation {
-            addPaymentToOrder(input: { method: "fp-e2e-pay", metadata: {} }) { ... on Order { id code state totalWithTax } ... on ErrorResult { errorCode message } }
-        }`);
-        expect(paid.addPaymentToOrder.state).toBe('PaymentSettled');
+        return trans.transitionOrderToState;
+    }
+
+    async function placeOrder(email: string, method = 'fp-e2e-pay'): Promise<{ id: string; code: string; total: number }> {
+        const trans = await checkoutToArrangingPayment(email);
+        expect(trans.state).toBe('ArrangingPayment');
+        const paid = await shopClient.query(gql`mutation ($method: String!) {
+            addPaymentToOrder(input: { method: $method, metadata: {} }) { ... on Order { id code state totalWithTax } ... on ErrorResult { errorCode message } }
+        }`, { method });
+        expect(paid.addPaymentToOrder.state).toBe(method === 'fp-e2e-auth' ? 'PaymentAuthorized' : 'PaymentSettled');
         return { id: paid.addPaymentToOrder.id, code: paid.addPaymentToOrder.code, total: paid.addPaymentToOrder.totalWithTax };
     }
 
@@ -747,5 +768,253 @@ run('@huloglobal/vendure-plugin-fraud-prevention (MariaDB)', () => {
         expect(oks).toHaveLength(1);
         const decisions = (await raw().query(`SELECT action FROM fraud_log WHERE orderId = ? AND action IN ('approved', 'rejected')`, [num(o.id)])) as any[];
         expect(decisions).toHaveLength(1);
+    });
+    // ── 0.21.0: hold mode, premium gates, parity features ─────────────
+    const setPremium = (on: boolean) => {
+        (FraudPreventionPlugin as any).licenceStatus = on ? { valid: true, message: 'e2e' } : { valid: false, message: 'e2e free' };
+    };
+    const adminFetch = async (path: string, init: { method?: string; body?: any } = {}) => {
+        await adminClient.asSuperAdmin();
+        const token = (adminClient as any).authToken as string;
+        const res = await fetch(`${BASE}/fraud-prevention/${path}`, {
+            method: init.method || 'GET',
+            headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` },
+            body: init.body === undefined ? undefined : JSON.stringify(init.body),
+        });
+        const text = await res.text();
+        let body: any = text;
+        try { body = JSON.parse(text); } catch { /* html */ }
+        return { status: res.status, body };
+    };
+    const setMode = async (mode: string, extra: Record<string, any> = {}) => {
+        await svc().saveConfig({ ...(await svc().getConfig(1)), channelId: 1, enabled: true, mode, reviewThreshold: 40, blockThreshold: 70, ...extra } as any);
+    };
+
+    it('IP intelligence is off by default, never calls ip-api without a key, and the key is never echoed', async () => {
+        const st = await adminFetch('settings');
+        expect(st.status).toBe(200);
+        expect(st.body).toMatchObject({ ipIntelEnabled: false, ipIntelKeySet: false });
+        const a = await svc().assess({ channelId: 1, email: 'intel@example.com', ip: '8.8.8.8', countryCode: 'GB', orderValuePence: 100, dryRun: true });
+        expect(a.signals.some(sg => sg.key === 'geo_mismatch' || sg.key === 'vpn_proxy')).toBe(false);
+        const bad = await adminFetch('settings', { method: 'POST', body: { ipIntelKey: 'not a key!' } });
+        expect(bad.status).toBe(400);
+        const saved = await adminFetch('settings', { method: 'POST', body: { ipIntelEnabled: false, ipIntelKey: 'e2eKey123456', logRetentionDays: 45 } });
+        expect(saved.status).toBe(200);
+        expect(saved.body).toMatchObject({ ipIntelKeySet: true, ipIntelKeyHint: '…3456', logRetentionDays: 45 });
+        expect(JSON.stringify(saved.body)).not.toContain('e2eKey123456');
+        expect(await svc().effectiveRetentionDays()).toBe(45);
+        await adminFetch('settings', { method: 'POST', body: { ipIntelKey: '', logRetentionDays: null } });
+        expect((await adminFetch('settings')).body).toMatchObject({ ipIntelKeySet: false, logRetentionDays: 180 });
+    });
+
+    it('hold mode (free) refuses a block-level order before the charge and logs it as refused', async () => {
+        setPremium(false);
+        await setMode('hold');
+        await svc().addEntry('blocklist', 'email', 'refuse.me@hold-test.example', 'e2e hold');
+        const seen: any[] = [];
+        const { EventBus } = await import('@vendure/core');
+        const { FraudPaymentRefusedEvent, FraudAssessedEvent } = await import('../src/events');
+        const sub1 = (server as any).app.get(EventBus).ofType(FraudPaymentRefusedEvent).subscribe((e: any) => seen.push(['refused', e.reason]));
+        const sub2 = (server as any).app.get(EventBus).ofType(FraudAssessedEvent).subscribe((e: any) => seen.push(['assessed', e.stage, e.outcome]));
+        const t = await checkoutToArrangingPayment('refuse.me+x@hold-test.example');
+        expect(t.errorCode).toBe('ORDER_STATE_TRANSITION_ERROR');
+        expect(t.transitionError).toMatch(/could not accept this order/i);
+        const [row] = await raw().query(`SELECT action, riskLevel, orderCode FROM fraud_log WHERE email = ? ORDER BY id DESC LIMIT 1`, ['refuse.me+x@hold-test.example']);
+        expect(row).toMatchObject({ action: 'refused', riskLevel: 'blocked' });
+        await new Promise(r => setTimeout(r, 300));
+        expect(seen).toContainEqual(['refused', 'block-level']);
+        expect(seen).toContainEqual(['assessed', 'pre-charge', 'refused']);
+        sub1.unsubscribe(); sub2.unsubscribe();
+        // A clean shopper goes straight through.
+        const ok = await checkoutToArrangingPayment('fine.shopper@example.com');
+        expect(ok.state).toBe('ArrangingPayment');
+        // Monitor mode never refuses.
+        await setMode('monitor');
+        const mon = await checkoutToArrangingPayment('refuse.me+y@hold-test.example');
+        expect(mon.state).toBe('ArrangingPayment');
+    });
+
+    it('enforce without premium refuses before the charge like hold (licence-lapse fallback)', async () => {
+        setPremium(false);
+        await setMode('enforce');
+        const t = await checkoutToArrangingPayment('refuse.me+z@hold-test.example');
+        expect(t.errorCode).toBe('ORDER_STATE_TRANSITION_ERROR');
+    });
+
+    it('an address in its failed-payment cooldown is refused before the charge; 0 minutes switches that off', async () => {
+        setPremium(false);
+        await setMode('hold', { cooldownMinutesAfterFailedPayment: 15, maxFailedPaymentsPerIpPerHour: 3 });
+        // The address the shop requests come from, as the pre-charge check saw it (127.0.0.1 or ::1).
+        const [seen] = await raw().query(`SELECT ip FROM fraud_log WHERE action = 'refused' AND ip <> '' ORDER BY id DESC LIMIT 1`);
+        const ip = String(seen.ip);
+        await raw().query(`DELETE FROM checkout_guard_payment_event WHERE ip = ?`, [ip]);
+        for (let i = 0; i < 3; i++) {
+            await raw().query(`INSERT INTO checkout_guard_payment_event (channelId, kind, provider, ip, createdAt) VALUES (1, 'failed', 'stripe', ?, DATE_SUB(NOW(), INTERVAL ? MINUTE))`, [ip, 61 + i]);
+        }
+        // All three are just over an hour old: no failed_payments signal from the hour window, but the cooldown holds.
+        const cfg = await svc().getConfig(1);
+        expect(await svc().failedPaymentState(ip, cfg)).toMatchObject({ hour: 0, window: 3, coolingDown: false });
+        await raw().query(`INSERT INTO checkout_guard_payment_event (channelId, kind, provider, ip, createdAt) VALUES (1, 'client_declined', 'stripe', ?, NOW())`, [ip]);
+        expect((await svc().failedPaymentState(ip, cfg)).coolingDown).toBe(true);
+        const t = await checkoutToArrangingPayment('cooldown.shopper@example.com');
+        expect(t.errorCode).toBe('ORDER_STATE_TRANSITION_ERROR');
+        expect(t.transitionError).toMatch(/try again later/i);
+        await setMode('hold', { cooldownMinutesAfterFailedPayment: 0, maxFailedPaymentsPerIpPerHour: 3 });
+        const ok = await checkoutToArrangingPayment('cooldown.shopper2@example.com');
+        expect(ok.state).toBe('ArrangingPayment');
+        await raw().query(`DELETE FROM checkout_guard_payment_event WHERE ip = ?`, [ip]);
+        await setMode('hold', { cooldownMinutesAfterFailedPayment: 15 });
+    });
+
+    it('scores an order left unpaid in ArrangingPayment once, as unpaid, without making it "assessed"', async () => {
+        await setMode('monitor');
+        const t = await checkoutToArrangingPayment('abandoned.cart@example.com');
+        expect(t.state).toBe('ArrangingPayment');
+        const id = num(t.id);
+        await raw().query(`UPDATE \`order\` SET updatedAt = DATE_SUB(NOW(), INTERVAL 20 MINUTE) WHERE id = ?`, [id]);
+        expect(await svc().scoreUnpaidOrders()).toBeGreaterThanOrEqual(1);
+        const rows = await raw().query(`SELECT action FROM fraud_log WHERE orderId = ?`, [id]);
+        expect(rows.map((r: any) => r.action)).toEqual(['unpaid']);
+        expect(await svc().isAssessed(id)).toBe(false);
+        expect(await svc().scoreUnpaidOrders()).toBe(0);
+    });
+
+    it('enforce (premium) holds a review-level order; approve captures the authorised payment and fires events', async () => {
+        setPremium(true);
+        // Every shop request in this suite comes from one address: lift the IP velocity limits so the
+        // earlier refused / unpaid attempts do not push this review-level order to block level.
+        await setMode('enforce', { maxOrdersPerIpPerHour: 1000, maxOrdersPerIpPerDay: 1000 });
+        await svc().addEntry('blocklist', 'email', 'review.me@example.com', 'e2e review');
+        const resolved: any[] = [];
+        const { EventBus } = await import('@vendure/core');
+        const { FraudCaseResolvedEvent, FraudCaseOpenedEvent } = await import('../src/events');
+        const bus = (server as any).app.get(EventBus);
+        const s1 = bus.ofType(FraudCaseResolvedEvent).subscribe((e: any) => resolved.push(e));
+        const s2 = bus.ofType(FraudCaseOpenedEvent).subscribe((e: any) => resolved.push({ opened: e.caseId }));
+        const o = await placeOrder('review.me@example.com', 'fp-e2e-auth');
+        expect(await waitForAssessment(o.id)).toBe(true);
+        const [c] = await raw().query(`SELECT id, status FROM fraud_blocked_orders WHERE orderId = ?`, [num(o.id)]);
+        expect(c.status).toBe('pending');
+        // HTTP fulfilment gate (premium): held.
+        const g = await adminFetch(`gate/${num(o.id)}`);
+        expect(g.status).toBe(200);
+        expect(g.body).toMatchObject({ assessed: true, held: true, caseStatus: 'pending', releasable: false });
+        expect((await adminFetch('held')).body.orderIds).toContain(num(o.id));
+
+        const r = await adminFetch(`cases/${c.id}/approve`, { method: 'POST', body: { notes: 'looks fine', notifyCustomer: false } });
+        expect([200, 201]).toContain(r.status);
+        expect(r.body.ok).toBe(true);
+        expect(r.body.captured).toHaveLength(1);
+        expect(settledByE2e).toContain(o.code);
+        const after = await adminOrder(o.id);
+        expect(after.payments[0].state).toBe('Settled');
+        expect(after.state).toBe('PaymentSettled');
+        expect((await adminFetch(`gate/${num(o.id)}`)).body.releasable).toBe(true);
+        await new Promise(res => setTimeout(res, 300));
+        expect(resolved.some(e => e.opened)).toBe(true);
+        expect(resolved.find(e => e.decision === 'approved')?.details?.captured).toHaveLength(1);
+        s1.unsubscribe(); s2.unsubscribe();
+    });
+
+    it('"Hold fulfilment" off keeps the case in the queue but releases the order', async () => {
+        setPremium(true);
+        await setMode('enforce', { holdFulfilment: false, maxOrdersPerIpPerHour: 1000, maxOrdersPerIpPerDay: 1000 });
+        const o = await placeOrder('review.me+nohold@example.com');
+        await waitForAssessment(o.id);
+        const [c] = await raw().query(`SELECT status FROM fraud_blocked_orders WHERE orderId = ?`, [num(o.id)]);
+        expect(c.status).toBe('pending');
+        expect(await svc().pendingOrderIds()).not.toContain(num(o.id));
+        expect(await svc().heldOrderIds()).not.toContain(num(o.id));
+        expect((await svc().fulfilmentGate(num(o.id))).releasable).toBe(true);
+        await setMode('enforce', { holdFulfilment: true, maxOrdersPerIpPerHour: 5, maxOrdersPerIpPerDay: 20 });
+        expect(await svc().heldOrderIds()).toContain(num(o.id));
+    });
+
+    it('the gate, alerts, weekly report and checklist are premium; weights stay free', async () => {
+        setPremium(false);
+        expect((await adminFetch('gate/1')).status).toBe(402);
+        expect((await adminFetch('held')).status).toBe(402);
+        expect((await adminFetch('digest/preview')).status).toBe(402);
+        expect((await adminFetch('digest/send-test', { method: 'POST', body: {} })).status).toBe(402);
+        const setup = await adminFetch('setup');
+        expect(setup.body).toMatchObject({ items: [], premium: false });
+        const ds = await adminFetch('digest/settings');
+        expect(ds.body.premium).toBe(false);
+        // Alerts: nothing reaches the mailer without premium.
+        const spy = jest.spyOn(svc() as any, 'smtpSettings');
+        await svc().sendAdminAlert('x', '<p>x</p>');
+        expect(spy).not.toHaveBeenCalled();
+        setPremium(true);
+        await svc().sendAdminAlert('x', '<p>x</p>');
+        expect(spy).toHaveBeenCalled();
+        spy.mockRestore();
+        expect((await adminFetch('setup')).body.items.length).toBeGreaterThan(0);
+        expect((await adminFetch('digest/preview')).status).toBe(200);
+        // Custom weights work on the free tier.
+        setPremium(false);
+        await setMode('monitor', { signalWeights: { plus_addressing: 33 } });
+        const a = await svc().assess({ channelId: 1, email: 'weights+x@example.com', orderValuePence: 100, dryRun: true });
+        expect(a.signals.find(sg => sg.key === 'plus_addressing')?.points).toBe(33);
+        await setMode('monitor', { signalWeights: {} });
+    });
+
+    it('CVC fail and card country vs billing country score; limits and details follow the order currency', async () => {
+        await setMode('monitor');
+        const a = await svc().assess({
+            channelId: 1, email: 'card@example.com', countryCode: 'GB', orderValuePence: 100, dryRun: true,
+            avs: { cvc: 'fail', cardCountry: 'NG', source: 'test' },
+        });
+        const keys = a.signals.map(sg => sg.key);
+        expect(keys).toContain('cvc_fail');
+        expect(keys).toContain('card_country_mismatch');
+        expect(a.signals.find(sg => sg.key === 'card_country_mismatch')!.detail).toMatch(/issued in NG, billing GB/);
+        const same = await svc().assess({ channelId: 1, email: 'card@example.com', countryCode: 'GB', orderValuePence: 100, dryRun: true, avs: { cvc: 'pass', cardCountry: 'GB' } });
+        expect(same.signals.some(sg => sg.key === 'cvc_fail' || sg.key === 'card_country_mismatch')).toBe(false);
+
+        const cfg = await svc().getConfig(1);
+        const ccy = cfg.currencyCode!;
+        expect(ccy).toMatch(/^[A-Z]{3}$/);
+        const gbp = await svc().assess({ channelId: 1, email: 'big@example.com', orderValuePence: cfg.maxOrderValuePence + 100, currencyCode: ccy, dryRun: true });
+        const detail = gbp.signals.find(sg => sg.key === 'order_value')!.detail;
+        expect(detail).toContain(formatMinor(cfg.maxOrderValuePence, ccy));
+        // The same number in yen is a small order: the limit is converted, not compared raw.
+        const jpy = await svc().assess({ channelId: 1, email: 'big@example.com', orderValuePence: cfg.maxOrderValuePence + 100, currencyCode: 'JPY', dryRun: true });
+        expect(jpy.signals.some(sg => sg.key === 'order_value')).toBe(false);
+    });
+
+    it('the orders-list risk column endpoint returns the latest score per order (admin only)', async () => {
+        const [row] = await raw().query(`SELECT orderId FROM fraud_log WHERE orderId IS NOT NULL ORDER BY id DESC LIMIT 1`);
+        const r = await adminFetch(`order-risk?ids=${row.orderId},999999,abc`);
+        expect(r.status).toBe(200);
+        expect(r.body[String(row.orderId)]).toHaveProperty('score');
+        expect(r.body['999999']).toBeUndefined();
+        const anon = await fetch(`${BASE}/fraud-prevention/order-risk?ids=${row.orderId}`);
+        expect([401, 403]).toContain(anon.status);
+    });
+
+    it('points out a proxy whose forwarding headers are ignored, and can dismiss it', async () => {
+        resetCheckLimiter();
+        for (const client of ['8.8.8.8', '1.1.1.1', '9.9.9.9']) {
+            await publicCheck({ email: 'p@example.com', orderValuePence: 1, channelId: 1 }, { 'x-forwarded-for': client });
+        }
+        const h = await adminFetch('proxy-hint');
+        expect(h.status).toBe(200);
+        expect(h.body.hint).toMatchObject({ header: 'x-forwarded-for' });
+        expect(h.body.hint.clients).toBeGreaterThanOrEqual(3);
+        expect(h.body.hint.peers.length).toBeGreaterThan(0);
+        expect((await adminFetch('proxy-hint/dismiss', { method: 'POST', body: {} })).status).toBe(200);
+        expect((await adminFetch('proxy-hint')).body.hint).toBeNull();
+    });
+
+    it('host signals from the extraSignals option are scored', async () => {
+        const opts = svc().getOptions();
+        svc().setOptions({ ...opts, extraSignals: async (input: any) => input.email === 'host.signal@example.com' ? [{ key: 'host_vip_mismatch', label: 'Host rule', points: 41, detail: 'from host' }] : [] });
+        const a = await svc().assess({ channelId: 1, email: 'host.signal@example.com', orderValuePence: 100, dryRun: true });
+        expect(a.signals.find(sg => sg.key === 'host_vip_mismatch')?.points).toBe(41);
+        svc().setOptions({ ...opts, extraSignals: () => { throw new Error('boom'); } });
+        const b = await svc().assess({ channelId: 1, email: 'host.signal@example.com', orderValuePence: 100, dryRun: true });
+        expect(b.signals.some(sg => sg.key === 'host_vip_mismatch')).toBe(false);
+        svc().setOptions(opts);
+        setPremium(false);
     });
 });

@@ -9,10 +9,15 @@ import { FraudPreventionPlugin, getOptions } from './plugin';
 import { clientIpFromRequest, fromTrustedProxy } from './net-util';
 import { CUSTOM_FEED_PRESETS, FRAUD_SOURCES } from './fraud-sources';
 import { FraudChannelConfig } from './types';
+import { formatMinor } from './money';
 
 /** Admin surface requires a logged-in admin with catalog permissions —
  *  same convention as the rest of the HULO suite. Returns true when the
  *  request was rejected (response already sent). */
+function licenceRequired(res: Response, message: string) {
+    return res.status(402).json({ error: 'licence_required', message, buyUrl: BUY_URL });
+}
+
 function denyUnlessAdmin(ctx: RequestContext, res: Response, write: boolean): boolean {
     const needed = write ? [Permission.UpdateCatalog] : [Permission.ReadCatalog];
     if (!isAdminApiSession(ctx) || !ctx.userHasPermissions(needed)) {
@@ -42,6 +47,7 @@ export class FraudPreventionController {
         if (!this.limiter.allow(`check:${ip || 'unknown'}`)) {
             return res.status(429).json({ error: 'rate_limited' });
         }
+        this.service.noteIgnoredForwarding(req as any, ipOpts);
         const channelId = Number(body?.channelId);
         const cfCountry = ipOpts.trustCloudflareHeader !== false && fromTrustedProxy(req as any, ipOpts)
             ? String(req.headers['cf-ipcountry'] || '') : '';
@@ -61,8 +67,9 @@ export class FraudPreventionController {
         // Public shape stays minimal — no signal internals for attackers to
         // probe. Explicit 200: a risk check is a read, not a 201 "create"
         // (Nest's default status for a POST handler).
+        // Not allowed = what the pre-charge check would refuse: block level in hold or enforce mode.
         return res.status(200).json({
-            allowed: assessment.action !== 'block',
+            allowed: !(assessment.level === 'blocked' && (assessment.action === 'block' || assessment.action === 'hold')),
             riskLevel: assessment.level,
         });
     }
@@ -97,7 +104,9 @@ export class FraudPreventionController {
     @Get('setup')
     async setup(@Ctx() ctx: RequestContext, @Res() res: Response) {
         if (denyUnlessAdmin(ctx, res, false)) return;
-        return res.json(await this.service.setupChecklist(FraudPreventionPlugin.hasPremiumAccess()));
+        // Premium (licence or evaluation): without it the checklist is empty and the card is hidden.
+        const premium = FraudPreventionPlugin.hasPremiumAccess();
+        return res.json({ ...(await this.service.setupChecklist(premium)), premium });
     }
 
     /** Light payload for the admin dashboard widget: three 7-day figures. */
@@ -112,7 +121,7 @@ export class FraudPreventionController {
             stats: [
                 { label: 'Orders risk-scored', value: formatStat({ key: 'ordersAssessed', label: '', value: s.ordersAssessed }) },
                 { label: 'Risky orders intercepted', value: formatStat({ key: 'ordersHeld', label: '', value: s.ordersHeld + s.ordersBlocked }) },
-                { label: 'Value intercepted', value: formatStat({ key: 'riskyValuePence', label: '', value: s.riskyValuePence, format: 'pence' }) },
+                { label: 'Value intercepted', value: formatMinor(s.riskyValuePence, (await this.service.defaultCurrency()) || 'GBP') },
             ],
             route: '/extensions/fraud-prevention',
         });
@@ -123,7 +132,8 @@ export class FraudPreventionController {
         if (denyUnlessAdmin(ctx, res, false)) return;
         const settings = await this.service.digestSettings();
         if (!settings) return res.status(503).json({ error: 'digest-unavailable' });
-        return res.json(settings);
+        // `premium` false: the report is not sent (it resumes, with these settings, under a licence).
+        return res.json({ ...settings, premium: FraudPreventionPlugin.hasPremiumAccess() });
     }
 
     @Post('digest/settings')
@@ -145,6 +155,7 @@ export class FraudPreventionController {
     @Post('digest/send-test')
     async digestSendTest(@Ctx() ctx: RequestContext, @Res() res: Response, @Body() body: any) {
         if (denyUnlessAdmin(ctx, res, true)) return;
+        if (!FraudPreventionPlugin.hasPremiumAccess()) return licenceRequired(res, 'The weekly report needs a licence or the evaluation.');
         const to = String(body?.to || '').trim().slice(0, 320) || undefined;
         if (to && !/^[^\s@]{1,64}@[^\s@]{1,190}\.[^\s@]{2,}$/.test(to)) {
             return res.status(400).json({ error: 'bad-request', message: 'Enter a valid email address' });
@@ -158,6 +169,7 @@ export class FraudPreventionController {
     @Get('digest/preview')
     async digestPreview(@Ctx() ctx: RequestContext, @Res() res: Response) {
         if (denyUnlessAdmin(ctx, res, false)) return;
+        if (!FraudPreventionPlugin.hasPremiumAccess()) return licenceRequired(res, 'The weekly report needs a licence or the evaluation.');
         const mail = await this.service.previewDigest();
         res.setHeader('content-type', 'text/html; charset=utf-8');
         res.setHeader('cache-control', 'no-store');
@@ -336,10 +348,12 @@ export class FraudPreventionController {
     @Post('cases/:id/approve')
     async approve(
         @Ctx() ctx: RequestContext, @Res() res: Response, @Param('id') id: string,
-        @Body() body: { notes?: string; notifyCustomer?: boolean },
+        @Body() body: { notes?: string; notifyCustomer?: boolean; capture?: boolean },
     ) {
         if (denyUnlessAdmin(ctx, res, true)) return;
-        const result = await this.service.resolveCase(Number(id), 'approved', body?.notes);
+        // `capture: false` releases the order without settling an authorised payment.
+        const result = await this.service.resolveCase(Number(id), 'approved', body?.notes,
+            { capture: body?.capture === undefined ? undefined : !!body.capture });
         if (result.ok && result.caseRow?.email) {
             const notif = await this.service.getNotificationConfig();
             // Per-case override wins; otherwise the settings default.
@@ -593,6 +607,72 @@ export class FraudPreventionController {
         }
         if (body?.sourceKey) return res.json(await this.service.syncSource(body.sourceKey));
         return res.json(await this.service.syncAll());
+    }
+
+    // ── Admin: install-wide settings (IP intelligence, log retention) ──
+    @Get('settings')
+    async getSettings(@Ctx() ctx: RequestContext, @Res() res: Response) {
+        if (denyUnlessAdmin(ctx, res, false)) return;
+        return res.json(await this.service.getGeneralSettings());
+    }
+
+    /** { ipIntelEnabled?, ipIntelKey? (string sets, '' or null clears), logRetentionDays? } — the key is never echoed back. */
+    @Post('settings')
+    async saveSettings(@Ctx() ctx: RequestContext, @Res() res: Response, @Body() body: any) {
+        if (denyUnlessAdmin(ctx, res, true)) return;
+        const patch: { ipIntelEnabled?: boolean; ipIntelKey?: string | null; logRetentionDays?: number | null } = {};
+        if (typeof body?.ipIntelEnabled === 'boolean') patch.ipIntelEnabled = body.ipIntelEnabled;
+        if (body && 'ipIntelKey' in body) patch.ipIntelKey = body.ipIntelKey === null ? null : String(body.ipIntelKey ?? '').slice(0, 200);
+        if (body && 'logRetentionDays' in body) patch.logRetentionDays = body.logRetentionDays === null ? null : Number(body.logRetentionDays);
+        try {
+            return res.status(200).json(await this.service.saveGeneralSettings(patch));
+        } catch (e: any) {
+            return res.status(400).json({ error: 'bad-request', message: e?.message || 'Invalid settings' });
+        }
+    }
+
+    // ── Admin: misconfigured-proxy notice ──────────────────────────────
+    @Get('proxy-hint')
+    async proxyHint(@Ctx() ctx: RequestContext, @Res() res: Response) {
+        if (denyUnlessAdmin(ctx, res, false)) return;
+        return res.json({ hint: await this.service.proxyHint(getOptions().trustedProxies || []) });
+    }
+
+    @Post('proxy-hint/dismiss')
+    async dismissProxyHint(@Ctx() ctx: RequestContext, @Res() res: Response) {
+        if (denyUnlessAdmin(ctx, res, true)) return;
+        await this.service.dismissProxyHint(getOptions().trustedProxies || []);
+        return res.status(200).json({ ok: true });
+    }
+
+    // ── Admin: risk column on the orders list ──────────────────────────
+    @Get('order-risk')
+    async orderRisk(@Ctx() ctx: RequestContext, @Res() res: Response, @Query('ids') ids?: string) {
+        if (denyUnlessAdmin(ctx, res, false)) return;
+        const list = String(ids || '').split(',').map(v => Number(v.trim())).filter(n => Number.isInteger(n) && n > 0).slice(0, 100);
+        res.setHeader('cache-control', 'private, no-store');
+        return res.json(await this.service.orderRisk(list));
+    }
+
+    // ── Admin: HTTP fulfilment gate (premium) ──────────────────────────
+    /** { orderId, assessed, held, caseStatus, releasable } — release only when `releasable`. */
+    @Get('gate/:orderId')
+    async gate(@Ctx() ctx: RequestContext, @Res() res: Response, @Param('orderId') orderId: string) {
+        if (denyUnlessAdmin(ctx, res, false)) return;
+        if (!FraudPreventionPlugin.hasPremiumAccess()) return licenceRequired(res, 'The HTTP fulfilment gate needs a licence or the evaluation.');
+        const id = Number(orderId);
+        if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: 'bad-order-id' });
+        res.setHeader('cache-control', 'private, no-store');
+        return res.json(await this.service.fulfilmentGate(id));
+    }
+
+    /** Order ids that must not be fulfilled (pending with Hold fulfilment on, or rejected). */
+    @Get('held')
+    async held(@Ctx() ctx: RequestContext, @Res() res: Response) {
+        if (denyUnlessAdmin(ctx, res, false)) return;
+        if (!FraudPreventionPlugin.hasPremiumAccess()) return licenceRequired(res, 'The HTTP fulfilment gate needs a licence or the evaluation.');
+        res.setHeader('cache-control', 'private, no-store');
+        return res.json({ orderIds: await this.service.heldOrderIds() });
     }
 
     // ── Admin: notifications ───────────────────────────────────────────

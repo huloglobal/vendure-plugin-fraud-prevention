@@ -6,6 +6,7 @@ import {
 import { createHash } from 'crypto';
 import { Injectable, OnModuleInit } from '@nestjs/common';
 import {
+    EventBus,
     ID,
     Logger,
     Order,
@@ -23,6 +24,7 @@ import * as http from 'http';
 import {
     DEFAULT_CONFIG,
     DEFAULT_WEIGHTS,
+    FRAUD_MODES,
     FraudAssessment,
     FraudChannelConfig,
     FraudMode,
@@ -31,11 +33,15 @@ import {
     RiskLevel,
 } from './types';
 import { BUILTIN_DISPOSABLE_DOMAINS, FRAUD_SOURCES } from './fraud-sources';
-import { ipInCidr, isCidr, normalizeEmail, normaliseIp } from './net-util';
+import { clientIpFromRequest, ignoredForwarding, ipInCidr, isCidr, normalizeEmail, normaliseIp, ClientIpOptions, ClientIpRequest } from './net-util';
+import { convertLimit, formatMinor, limitScale, normaliseCurrency } from './money';
+import { FraudAssessedEvent, FraudCaseOpenedEvent, FraudCaseResolvedEvent, FraudEventSubject, FraudPaymentRefusedEvent } from './events';
 import {
     CardChecks,
     avsFromMetadata,
     describeAvs,
+    describeCardCountry,
+    describeCvc,
     describeRadar,
     describeThreeDs,
     fetchStripeCardChecks,
@@ -56,11 +62,54 @@ export const PLUGIN_DISPLAY_NAME = 'Fraud Prevention';
 export const BUY_URL = `https://elite.charity/licence/buy/${SHORT_ID}`;
 /** What the free tier loses — shown on the trial/free banners, the widget and the weekly report. */
 export const PREMIUM_FEATURES = [
-    'Enforce mode (auto-hold risky orders)',
-    'Review queue with one-click approve/reject',
-    'Threat feeds and custom blocklists',
-    'Email and chat alerts',
+    'Enforce mode: risky orders wait in the review queue (approve captures an authorised payment, reject cancels and refunds)',
+    'HTTP fulfilment gate for external fulfilment',
+    'Nightly threat feeds and custom feed URLs',
+    'Email and chat alerts, monitor-mode alerts included',
+    'Weekly report and setup checklist',
 ];
+
+const esc = (v: unknown) => String(v ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c] as string));
+
+/** Lazy plugin lookup (avoids a static plugin<->service import cycle at load time). */
+function premiumActive(): boolean {
+    try {
+        // eslint-disable-next-line @typescript-eslint/no-var-requires
+        const { FraudPreventionPlugin } = require('./plugin');
+        return !!FraudPreventionPlugin.hasPremiumAccess();
+    } catch {
+        return false;
+    }
+}
+
+/** Fraud-log actions that are not a placed-order assessment: the pre-charge
+ *  refusal and the score of an order left unpaid. They count for velocity
+ *  but never make an order "assessed" for the fulfilment gate. */
+export const UNPLACED_ACTIONS = ['refused', 'unpaid'] as const;
+
+/** Install-wide settings kept in hulo_plugin_prefs (Settings tab). */
+export interface GeneralSettings {
+    /** IP intelligence (ip-api.com Pro) switched on. Off by default. */
+    ipIntelEnabled: boolean;
+    /** A key is saved (or comes from the ipApiKey option). Never the key itself. */
+    ipIntelKeySet: boolean;
+    /** Last four characters of the key in force, for recognition. */
+    ipIntelKeyHint: string | null;
+    /** The key comes from the plugin's init option and cannot be changed here. */
+    ipIntelKeyFromOptions: boolean;
+    /** Activity-log retention in days (0 = keep forever). */
+    logRetentionDays: number;
+}
+
+/** What the proxy notice says (null when there is nothing to point out). */
+export interface ProxyHint {
+    peers: string[];
+    header: string;
+    clients: number;
+}
+
+/** A peer is pointed out once it forwarded for this many different public clients. */
+export const PROXY_HINT_MIN_CLIENTS = 3;
 
 /** Usage counters for one period. Numbers only, never personal data: they go to the
  *  licence server (evaluation + heartbeat) and into the weekly report. */
@@ -83,12 +132,18 @@ const STAT_LABELS: Array<{ key: keyof UsageStats; label: string; format?: 'count
 ];
 
 /** Shape usage counters as digest rows (label + format), in headline order. */
-export function toDigestStats(current: UsageStats, previous?: UsageStats | null): DigestStat[] {
-    return STAT_LABELS.map(s => ({
-        key: s.key, label: s.label, value: Number(current[s.key] || 0),
-        previous: previous ? Number(previous[s.key] || 0) : undefined,
-        format: s.format || 'count',
-    }));
+export function toDigestStats(current: UsageStats, previous?: UsageStats | null, currencyCode?: string | null): DigestStat[] {
+    return STAT_LABELS.map(s => {
+        const value = Number(current[s.key] || 0);
+        const base: DigestStat = {
+            key: s.key, label: s.label, value,
+            previous: previous ? Number(previous[s.key] || 0) : undefined,
+            format: s.format || 'count',
+        };
+        // Money in the store's own currency (the SDK's 'pence' format is pounds-only).
+        if (s.format === 'pence') return { ...base, format: 'text', text: formatMinor(value, currencyCode || 'GBP') };
+        return base;
+    });
 }
 
 export interface SetupItem {
@@ -125,6 +180,13 @@ export interface AssessInput {
     isReturningCustomer?: boolean;
     /** Dry-run: skip logging + case creation (Simulate tab). */
     dryRun?: boolean;
+    /** ISO currency of `orderValuePence` (the order's currency). Value
+     *  limits are in the channel's default currency and are converted when
+     *  the two differ. Unset = the channel's currency. */
+    currencyCode?: string;
+    /** The order is not placed yet (pre-charge check, unpaid scoring): it is
+     *  not in the placed-order counts, so velocity adds one for itself. */
+    unplaced?: boolean;
     /** Anonymous storefront pre-check: only signals about the caller's own
      *  attempt (its IP and that IP's lists/velocity, the e-mail's domain and
      *  shape, value, country). No allowlist, no e-mail lists, no e-mail
@@ -143,6 +205,8 @@ export interface ResolveCaseResult {
     orderState?: string;
     /** Reject only: refunds created, in minor units. */
     refunds?: Array<{ paymentId: number; amount: number }>;
+    /** Approve only: payment ids settled (captured) by the approval. */
+    captured?: number[];
     /** Reject only: Vendure-side steps that did not go through. The case
      *  is still closed; an admin should finish these by hand. */
     warnings?: string[];
@@ -156,7 +220,20 @@ export class FraudPreventionService implements OnModuleInit {
         private connection: TransactionalConnection,
         private orderService: OrderService,
         private requestContextService: RequestContextService,
+        private eventBus: EventBus,
     ) {}
+
+    /** Publish an extension event; never lets a bus problem reach the caller. */
+    publish(event: any): void {
+        try { this.eventBus.publish(event); } catch (e: any) { Logger.debug(`event publish failed: ${e?.message}`, loggerCtx); }
+    }
+
+    subjectOf(input: AssessInput): FraudEventSubject {
+        return {
+            channelId: input.channelId, orderId: input.orderId, orderCode: input.orderCode,
+            email: input.email, ip: input.ip, orderValue: input.orderValuePence, currencyCode: input.currencyCode,
+        };
+    }
 
     setOptions(opts: FraudPreventionPluginOptions) {
         this.options = opts;
@@ -259,7 +336,7 @@ export class FraudPreventionService implements OnModuleInit {
     /** Top three non-zero 30-day figures, formatted, for the licence banner ("So far: …"). */
     async recentStats(): Promise<Array<{ label: string; value: string }>> {
         const to = new Date();
-        const rows = toDigestStats(await this.usageStats(new Date(to.getTime() - 30 * 86_400_000), to));
+        const rows = toDigestStats(await this.usageStats(new Date(to.getTime() - 30 * 86_400_000), to), null, await this.defaultCurrency());
         return rows.filter(s => s.value > 0).slice(0, 3).map(s => ({ label: s.label, value: formatStat(s) }));
     }
 
@@ -267,6 +344,8 @@ export class FraudPreventionService implements OnModuleInit {
     /** Real checks against the live configuration and tables. The same items drive the
      *  digest's "next steps". `premium` marks what the free tier cannot complete. */
     async setupChecklist(premium: boolean): Promise<{ items: SetupItem[]; complete: boolean }> {
+        // Premium only (licence or evaluation): without it there is no checklist at all.
+        if (!premium) return { items: [], complete: true };
         const configs = await this.getAllConfigs().catch(() => [] as FraudChannelConfig[]);
         const modeOn = configs.some(c => c.enabled && c.mode !== 'off');
         const enforceOn = configs.some(c => c.enabled && c.mode === 'enforce');
@@ -281,13 +360,13 @@ export class FraudPreventionService implements OnModuleInit {
         const url = base ? `${base}/admin/extensions/fraud-prevention` : undefined;
         const items: SetupItem[] = [
             { key: 'mode', label: 'Scoring switched on for a channel', done: modeOn, tab: 'rules', url,
-              hint: 'Pick Monitor or Enforce under Rules. Off means orders are scored in the background but nothing is logged or held.' },
+              hint: 'Pick Monitor, Hold or Enforce under Rules. Off means orders are scored in the background but nothing is held.' },
             { key: 'enforce', label: 'Enforce mode on at least one channel', done: enforceOn, tab: 'rules', url,
-              hint: `Monitor only logs what it sees. Enforce holds risky orders in the review queue until you approve them${premium ? '' : ' — needs a licence or the evaluation'}.` },
+              hint: 'Hold refuses block-level orders before the charge. Enforce also keeps risky placed orders in the review queue until you approve them.' },
             { key: 'alertEmail', label: 'Alert email set', done: !!notif.adminEmail, tab: 'settings', url,
               hint: 'Under Settings → Notifications → Email, enter the address that should hear about held orders (needs SMTP on the server).' },
             { key: 'feeds', label: 'Threat feeds synced in the last 7 days', done: feedsFresh, tab: 'lists', url,
-              hint: `Press "Sync all now" under Lists; afterwards the feeds refresh nightly at 03:00${premium ? '' : ' — needs a licence or the evaluation'}.` },
+              hint: 'Press "Sync all now" under Lists; afterwards the feeds refresh nightly at 03:00.' },
             { key: 'firstCase', label: 'First review case worked', done: worked.length > 0, tab: 'review', url,
               hint: 'Approve or reject a held order in the Review queue. Approve releases it; reject cancels and refunds it in Vendure.' },
         ];
@@ -313,8 +392,22 @@ export class FraudPreventionService implements OnModuleInit {
         return this.digest;
     }
 
-    /** Worker only — the caller checks ProcessContext. */
-    startDigest(): void { this.digest?.start(); }
+    private digestTimer: NodeJS.Timeout | null = null;
+
+    /**
+     * Worker only — the caller checks ProcessContext. The weekly report is a
+     * premium feature: the scheduler wakes hourly and only lets the SDK's
+     * WeeklyDigest send while a licence or the evaluation is active. When
+     * the licence lapses it simply stops; settings and history are kept.
+     */
+    startDigest(): void {
+        if (!this.digest || this.digestTimer) return;
+        const tick = () => { if (premiumActive()) void this.digest?.tick().catch(() => undefined); };
+        const first = setTimeout(tick, 90_000);
+        if (typeof first.unref === 'function') first.unref();
+        this.digestTimer = setInterval(tick, 60 * 60_000);
+        if (typeof this.digestTimer.unref === 'function') this.digestTimer.unref();
+    }
 
     async digestSettings(): Promise<WeeklyDigestSettings | null> { return this.digest ? this.digest.settings() : null; }
     async updateDigestSettings(patch: { enabled?: boolean; recipient?: string | null }): Promise<WeeklyDigestSettings | null> {
@@ -346,7 +439,7 @@ export class FraudPreventionService implements OnModuleInit {
             .map(i => ({ title: i.label, body: i.hint, url: i.url }));
         const base = (this.options.publicBaseUrl || '').replace(/\/$/, '');
         return {
-            stats: toDigestStats(current, previous),
+            stats: toDigestStats(current, previous, await this.defaultCurrency()),
             tips,
             tier,
             licence: describeLicence(this.digestHooks?.licenceStatus() ?? null),
@@ -443,6 +536,8 @@ export class FraudPreventionService implements OnModuleInit {
         // The host fulfilment gate and the order panel look assessments up by order.
         await this.db.query(`ALTER TABLE fraud_log ADD INDEX IF NOT EXISTS idx_fraud_log_order (orderId)`).catch(() => undefined);
         await this.db.query(`ALTER TABLE fraud_log ADD INDEX IF NOT EXISTS idx_fraud_log_channel (channelId, createdAt)`);
+        // Velocity counts unpaid / refused attempts by address from the log.
+        await this.db.query(`ALTER TABLE fraud_log ADD INDEX IF NOT EXISTS idx_fraud_log_ip (ip, createdAt)`).catch(() => undefined);
 
         await this.db.query(`
             CREATE TABLE IF NOT EXISTS fraud_blocked_orders (
@@ -566,7 +661,7 @@ export class FraudPreventionService implements OnModuleInit {
             channelId: row.channelId,
             channelCode,
             enabled: !!row.enabled,
-            mode: (['off', 'monitor', 'enforce'].includes(row.mode) ? row.mode : 'monitor') as FraudMode,
+            mode: (FRAUD_MODES.includes(row.mode) ? row.mode : 'monitor') as FraudMode,
             reviewThreshold: row.reviewThreshold ?? 40,
             blockThreshold: row.blockThreshold ?? 70,
             holdFulfilment: row.holdFulfilment == null ? true : !!row.holdFulfilment,
@@ -593,13 +688,42 @@ export class FraudPreventionService implements OnModuleInit {
 
     async getAllConfigs(): Promise<FraudChannelConfig[]> {
         const channels = await this.db.query(
-            `SELECT id AS channelId, code AS channelCode FROM channel ORDER BY id`,
+            `SELECT id AS channelId, code AS channelCode, \`defaultCurrencyCode\` AS currencyCode FROM channel ORDER BY id`,
         );
         const rows = await this.db.query(`SELECT * FROM fraud_config`).catch(() => []);
         return channels.map((ch: any) => {
-            const existing = rows.find((r: any) => r.channelId === ch.channelId);
-            if (existing) return this.rowToConfig(existing, ch.channelCode);
-            return { ...DEFAULT_CONFIG, channelId: ch.channelId, channelCode: ch.channelCode };
+            const existing = rows.find((r: any) => Number(r.channelId) === Number(ch.channelId));
+            const currencyCode = normaliseCurrency(ch.currencyCode) || undefined;
+            if (existing) return { ...this.rowToConfig(existing, ch.channelCode), currencyCode };
+            return { ...this.defaultConfigFor(currencyCode), channelId: ch.channelId, channelCode: ch.channelCode, currencyCode };
+        });
+    }
+
+    /** Defaults with the value limits scaled to the channel's currency (a yen
+     *  channel must not flag every ordinary order as high value). */
+    defaultConfigFor(currencyCode?: string | null): Omit<FraudChannelConfig, 'channelId' | 'channelCode'> {
+        const k = limitScale(currencyCode);
+        return {
+            ...DEFAULT_CONFIG,
+            maxDailyValuePerEmailPence: DEFAULT_CONFIG.maxDailyValuePerEmailPence * k,
+            maxOrderValuePence: DEFAULT_CONFIG.maxOrderValuePence * k,
+            requireEmailVerificationAbovePence: DEFAULT_CONFIG.requireEmailVerificationAbovePence * k,
+            signalWeights: {},
+        };
+    }
+
+    /** The default channel's currency (reports and the widget). */
+    async defaultCurrency(): Promise<string | undefined> {
+        return this.cached('currency:default', 300_000, async () => {
+            const [row] = await this.db.query(`SELECT \`defaultCurrencyCode\` AS currencyCode FROM channel ORDER BY id LIMIT 1`).catch(() => []);
+            return normaliseCurrency(row?.currencyCode) || undefined;
+        });
+    }
+
+    private async channelCurrency(channelId: number): Promise<string | undefined> {
+        return this.cached(`currency:${channelId}`, 300_000, async () => {
+            const [row] = await this.db.query(`SELECT \`defaultCurrencyCode\` AS currencyCode FROM channel WHERE id = ?`, [channelId]).catch(() => []);
+            return normaliseCurrency(row?.currencyCode) || undefined;
         });
     }
 
@@ -617,8 +741,9 @@ export class FraudPreventionService implements OnModuleInit {
     async getConfig(channelId: number): Promise<FraudChannelConfig> {
         return this.cached(`config:${channelId}`, 30_000, async () => {
             const rows = await this.db.query(`SELECT * FROM fraud_config WHERE channelId = ?`, [channelId]).catch(() => []);
-            if (rows.length) return this.rowToConfig(rows[0]);
-            return { ...DEFAULT_CONFIG, channelId };
+            const currencyCode = await this.channelCurrency(channelId).catch(() => undefined);
+            if (rows.length) return { ...this.rowToConfig(rows[0]), currencyCode };
+            return { ...this.defaultConfigFor(currencyCode), channelId, currencyCode };
         });
     }
 
@@ -631,7 +756,7 @@ export class FraudPreventionService implements OnModuleInit {
         for (const k of ['maxOrdersPerIpPerHour', 'maxOrdersPerIpPerDay', 'maxOrdersPerEmailPerDay', 'maxDailyValuePerEmailPence', 'maxOrderValuePence', 'requireEmailVerificationAbovePence', 'maxFailedPaymentsPerIpPerHour', 'cooldownMinutesAfterFailedPayment', 'autoApproveAfterHours'] as const) {
             (c as any)[k] = num((c as any)[k], (DEFAULT_CONFIG as any)[k] ?? 0);
         }
-        if (!['off', 'monitor', 'enforce'].includes(String(c.mode))) c.mode = DEFAULT_CONFIG.mode;
+        if (!FRAUD_MODES.includes(String(c.mode) as FraudMode)) c.mode = DEFAULT_CONFIG.mode;
         this.forget('config:'); this.forget('stats:');
         await this.db.query(
             `INSERT INTO fraud_config (channelId, enabled, mode, reviewThreshold, blockThreshold, holdFulfilment,
@@ -687,6 +812,10 @@ export class FraudPreventionService implements OnModuleInit {
 
         const norm = input.email ? normalizeEmail(input.email) : null;
         const pub = input.publicCheck === true;
+        // Limits are in the channel's currency; amounts in signal details in the order's.
+        const orderCurrency = normaliseCurrency(input.currencyCode) || cfg.currencyCode || undefined;
+        const limit = (v: number) => convertLimit(v, cfg.currencyCode, orderCurrency);
+        const money = (v: number) => formatMinor(v, orderCurrency);
         if (input.ip) input.ip = normaliseIp(input.ip);
 
         // The two network lookups start now and are awaited where their signals are scored,
@@ -760,7 +889,9 @@ export class FraudPreventionService implements OnModuleInit {
                  WHERE \`customFieldsIp\` = ? AND \`orderPlacedAt\` > DATE_SUB(NOW(), INTERVAL 1 HOUR)`,
                 [input.ip],
             );
-            const hourCnt = Number(hourRow?.cnt || 0);
+            const self = input.unplaced ? 1 : 0;
+            const attempts = await this.unplacedAttemptsByIp(input.ip, input.orderId);
+            const hourCnt = Number(hourRow?.cnt || 0) + attempts.hour + self;
             if (hourCnt >= cfg.maxOrdersPerIpPerHour) {
                 push('ip_velocity_hour', 'IP velocity (hour)', `${hourCnt} orders/hour (limit ${cfg.maxOrdersPerIpPerHour})`);
             } else if (hourCnt >= Math.ceil(cfg.maxOrdersPerIpPerHour * 0.7)) {
@@ -771,7 +902,7 @@ export class FraudPreventionService implements OnModuleInit {
                  WHERE \`customFieldsIp\` = ? AND \`orderPlacedAt\` > DATE_SUB(NOW(), INTERVAL 24 HOUR)`,
                 [input.ip],
             );
-            const dayCnt = Number(dayRow?.cnt || 0);
+            const dayCnt = Number(dayRow?.cnt || 0) + attempts.day + self;
             if (dayCnt >= cfg.maxOrdersPerIpPerDay) {
                 push('ip_velocity_day', 'IP velocity (24h)', `${dayCnt} orders/24h (limit ${cfg.maxOrdersPerIpPerDay})`);
             }
@@ -784,21 +915,29 @@ export class FraudPreventionService implements OnModuleInit {
             const like = norm.canonical === norm.email
                 ? [norm.email]
                 : [norm.email, norm.canonical];
+            // The order being scored is counted once: excluded from the query (when it
+            // is already placed) and its own value added below. Spend is summed in the
+            // order's own currency only.
+            const params: any[] = [...like];
+            let extra = '';
+            if (input.orderId) { extra += ' AND o.id <> ?'; params.push(input.orderId); }
+            if (orderCurrency) { extra += ' AND o.`currencyCode` = ?'; params.push(orderCurrency); }
             const [emailRow] = await this.db.query(
                 `SELECT COUNT(*) AS cnt, COALESCE(SUM(o.\`subTotalWithTax\`), 0) AS totalValue
                  FROM \`order\` o JOIN customer c ON c.id = o.\`customerId\`
                  WHERE c.\`emailAddress\` IN (${like.map(() => '?').join(',')})
-                   AND o.\`orderPlacedAt\` > DATE_SUB(NOW(), INTERVAL 24 HOUR)`,
-                like,
+                   AND o.\`orderPlacedAt\` > DATE_SUB(NOW(), INTERVAL 24 HOUR)${extra}`,
+                params,
             );
-            const cnt = Number(emailRow?.cnt || 0);
+            const cnt = Number(emailRow?.cnt || 0) + (input.orderId || input.unplaced ? 1 : 0);
             const val = Number(emailRow?.totalValue || 0);
             if (cnt >= cfg.maxOrdersPerEmailPerDay) {
                 push('email_velocity_day', 'Email velocity (24h)', `${cnt} orders/24h (limit ${cfg.maxOrdersPerEmailPerDay})`);
             }
-            if (val + input.orderValuePence > cfg.maxDailyValuePerEmailPence) {
+            const dayLimit = limit(cfg.maxDailyValuePerEmailPence);
+            if (val + input.orderValuePence > dayLimit) {
                 push('email_value_day', 'Email daily value',
-                    `£${((val + input.orderValuePence) / 100).toFixed(2)} > £${(cfg.maxDailyValuePerEmailPence / 100).toFixed(2)} limit`);
+                    `${money(val + input.orderValuePence)} > ${money(dayLimit)} limit`);
             }
         }
 
@@ -886,10 +1025,23 @@ export class FraudPreventionService implements OnModuleInit {
             }
         }
 
+        // 5j. Card security code — the issuer's verdict; only an explicit FAIL scores.
+        // 5k. Card issued in another country than the billing address.
+        if (input.avs) {
+            if (input.avs.cvc === 'fail') {
+                push('cvc_fail', 'Card CVC check failed', describeCvc(input.avs));
+            }
+            if (input.avs.cardCountry && input.countryCode
+                && input.avs.cardCountry.toUpperCase() !== input.countryCode.toUpperCase()) {
+                push('card_country_mismatch', 'Card country differs from billing country', describeCardCountry(input.avs, input.countryCode));
+            }
+        }
+
         // 6. Order value.
-        if (input.orderValuePence > cfg.maxOrderValuePence) {
+        const valueLimit = limit(cfg.maxOrderValuePence);
+        if (input.orderValuePence > valueLimit) {
             push('order_value', 'High order value',
-                `£${(input.orderValuePence / 100).toFixed(2)} > £${(cfg.maxOrderValuePence / 100).toFixed(2)} limit`);
+                `${money(input.orderValuePence)} > ${money(valueLimit)} limit`);
         }
 
         // 7. Customer history — positive trust for a track record, caution
@@ -918,9 +1070,9 @@ export class FraudPreventionService implements OnModuleInit {
             push('returning_customer_3plus', 'Trusted returning customer', `${settledCount} settled orders`);
         } else if (settledCount >= 1) {
             push('returning_customer_2', 'Returning customer', `${settledCount} settled order(s)`);
-        } else if (settledCount === 0 && input.orderValuePence > cfg.requireEmailVerificationAbovePence) {
+        } else if (settledCount === 0 && input.orderValuePence > limit(cfg.requireEmailVerificationAbovePence)) {
             push('new_customer_high_value', 'First order, high value',
-                `first order at £${(input.orderValuePence / 100).toFixed(2)}`);
+                `first order at ${money(input.orderValuePence)}`);
         }
 
         // 8. High-risk countries.
@@ -934,20 +1086,31 @@ export class FraudPreventionService implements OnModuleInit {
         // 9. Failed payments from this IP — Vendure Payment rows that ended
         //    Declined/Error/Cancelled, plus (when the checkout-guard plugin
         //    is installed) gateway failures and client-side declines it
-        //    recorded before any Payment row existed.
+        //    recorded before any Payment row existed. An address that reached
+        //    the limit stays in its cooldown for cooldownMinutesAfterFailedPayment
+        //    after its latest failure, and keeps the signal for that long.
         if (input.ip) {
-            const [fpRow] = await this.db.query(
-                `SELECT COUNT(*) AS cnt FROM payment p JOIN \`order\` o ON o.id = p.\`orderId\`
-                 WHERE o.\`customFieldsIp\` = ? AND p.state IN ('Declined', 'Error', 'Cancelled')
-                   AND p.\`createdAt\` > DATE_SUB(NOW(), INTERVAL 1 HOUR)`,
-                [input.ip],
-            );
-            const vendureCnt = Number(fpRow?.cnt || 0);
-            const guardCnt = await this.countCheckoutGuardFailures(input.ip, 60);
-            const cnt = vendureCnt + guardCnt;
-            if (cnt >= cfg.maxFailedPaymentsPerIpPerHour) {
-                const via = guardCnt ? ` (${vendureCnt} payment records + ${guardCnt} gateway/client declines)` : '';
-                push('failed_payments', 'Failed payments', `${cnt} failed payments from IP in the last hour${via}`);
+            const fp = await this.failedPaymentState(input.ip, cfg);
+            if (fp.hour >= cfg.maxFailedPaymentsPerIpPerHour && cfg.maxFailedPaymentsPerIpPerHour > 0) {
+                const via = fp.guard ? ` (${fp.hour - fp.guard} payment records + ${fp.guard} gateway/client declines)` : '';
+                push('failed_payments', 'Failed payments', `${fp.hour} failed payments from IP in the last hour${via}`);
+            } else if (fp.coolingDown) {
+                push('failed_payments', 'Failed payments', `${fp.window} failed payments from IP; in the ${cfg.cooldownMinutesAfterFailedPayment}-minute cooldown after the latest`);
+            }
+        }
+
+        // 10. Host-supplied signals (extraSignals option). A throw is ignored.
+        if (this.options.extraSignals) {
+            try {
+                const extra = await this.options.extraSignals({ ...input }, cfg);
+                for (const sig of Array.isArray(extra) ? extra : []) {
+                    if (!sig || typeof sig.key !== 'string' || !sig.key) continue;
+                    const pts = cfg.signalWeights?.[sig.key] ?? Number(sig.points);
+                    if (!Number.isFinite(pts) || pts === 0) continue;
+                    signals.push({ key: sig.key.slice(0, 64), label: String(sig.label || sig.key).slice(0, 120), points: Math.round(pts), detail: String(sig.detail || '').slice(0, 500) });
+                }
+            } catch (e: any) {
+                Logger.warn(`extraSignals threw: ${e?.message || e}`, loggerCtx);
             }
         }
 
@@ -957,19 +1120,17 @@ export class FraudPreventionService implements OnModuleInit {
         else if (score >= cfg.reviewThreshold) level = 'review';
         else if (score >= Math.floor(cfg.reviewThreshold / 2)) level = 'medium';
 
-        // FREE tier never enforces — a configured 'enforce' downgrades to
-        // monitor (flag + log) until a valid licence is present.
+        // Enforce is premium. Without a licence or the evaluation it works as
+        // the free Hold mode: block-level orders are still refused before the
+        // charge, never weaker than what the free tier offers.
         let effectiveMode = cfg.mode;
-        if (effectiveMode === 'enforce') {
-            // Lazy import avoids a static plugin<->service cycle at load time.
-            const { FraudPreventionPlugin } = require('./plugin');
-            if (!FraudPreventionPlugin.hasPremiumAccess()) effectiveMode = 'monitor';
-        }
+        if (effectiveMode === 'enforce' && !premiumActive()) effectiveMode = 'hold';
 
         let action: FraudAssessment['action'] = 'allow';
         if (level === 'review' || level === 'blocked') {
             action = protectionOff ? 'shadow'
-                : effectiveMode === 'enforce' ? (level === 'blocked' ? 'block' : 'review') : 'flag';
+                : effectiveMode === 'enforce' ? (level === 'blocked' ? 'block' : 'review')
+                : effectiveMode === 'hold' ? 'hold' : 'flag';
         }
 
         return { score, level, signals, allowlisted: false, action, mode: effectiveMode, protectionActive: !protectionOff };
@@ -1000,7 +1161,7 @@ export class FraudPreventionService implements OnModuleInit {
             if (this.options.avsResolver) {
                 try {
                     const r = await this.options.avsResolver({ ...order, payments: candidates } as any, ctx);
-                    if (r && (r.postalCode || r.line1 || r.riskLevel || r.threeDsAuthenticated !== undefined)) return r;
+                    if (r && (r.postalCode || r.line1 || r.riskLevel || r.cvc || r.cardCountry || r.threeDsAuthenticated !== undefined)) return r;
                 } catch (e: any) {
                     Logger.warn(`avsResolver threw for ${order.code}: ${e.message}`, loggerCtx);
                 }
@@ -1093,7 +1254,8 @@ export class FraudPreventionService implements OnModuleInit {
     }
 
     // ── Logging + cases ────────────────────────────────────────────────
-    async logAssessment(input: AssessInput, a: FraudAssessment): Promise<void> {
+    /** `action` overrides the logged action (`refused`, `unpaid`). */
+    async logAssessment(input: AssessInput, a: FraudAssessment, action?: string): Promise<void> {
         await this.db.query(
             `INSERT INTO fraud_log (channelId, orderId, orderCode, ip, email, riskScore, riskLevel, reasons, action, signals, createdAt)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())`,
@@ -1101,7 +1263,7 @@ export class FraudPreventionService implements OnModuleInit {
                 input.channelId, input.orderId || null, input.orderCode || null,
                 input.ip || '', input.email || '', a.score, a.level,
                 a.signals.map(s => `${s.label}: ${s.detail}`).join('; ') || (a.allowlisted ? 'allowlisted' : ''),
-                a.action, JSON.stringify(a.signals),
+                action || a.action, JSON.stringify(a.signals),
             ],
         );
     }
@@ -1124,14 +1286,17 @@ export class FraudPreventionService implements OnModuleInit {
             ],
             { needInsertId: true },
         );
+        this.publish(new FraudCaseOpenedEvent(Number(res.insertId), this.subjectOf(input), a));
         return res.insertId;
     }
 
     /** Order ids with a pending review case — hosts use this to gate
      *  fulfilment (e.g. licence-key release). */
     async pendingOrderIds(): Promise<number[]> {
+        // A channel with "Hold fulfilment" off keeps its cases in the queue but does not hold the orders.
         const rows = await this.db.query(
-            `SELECT orderId FROM fraud_blocked_orders WHERE status = 'pending' AND orderId IS NOT NULL`,
+            `SELECT bo.orderId FROM fraud_blocked_orders bo LEFT JOIN fraud_config fc ON fc.channelId = bo.channelId
+             WHERE bo.status = 'pending' AND bo.orderId IS NOT NULL AND (fc.holdFulfilment IS NULL OR fc.holdFulfilment <> 0)`,
         ).catch(() => []);
         return rows.map((r: any) => Number(r.orderId));
     }
@@ -1141,10 +1306,51 @@ export class FraudPreventionService implements OnModuleInit {
      *  `pendingOrderIds()` alone release a rejected order the moment the
      *  case closes; use this set instead. */
     async heldOrderIds(): Promise<number[]> {
+        // Rejected is never fulfilled; pending holds unless the channel's "Hold fulfilment" is off.
         const rows = await this.db.query(
-            `SELECT orderId FROM fraud_blocked_orders WHERE status IN ('pending', 'rejected') AND orderId IS NOT NULL`,
+            `SELECT bo.orderId FROM fraud_blocked_orders bo LEFT JOIN fraud_config fc ON fc.channelId = bo.channelId
+             WHERE bo.orderId IS NOT NULL
+               AND (bo.status = 'rejected' OR (bo.status = 'pending' AND (fc.holdFulfilment IS NULL OR fc.holdFulfilment <> 0)))`,
         ).catch(() => []);
-        return rows.map((r: any) => Number(r.orderId));
+        return Array.from(new Set<number>(rows.map((r: any) => Number(r.orderId))));
+    }
+
+    /**
+     * The fulfilment verdict for one order (HTTP gate and host code):
+     * releasable once the placed order has been assessed and no case holds
+     * it (pending with "Hold fulfilment" on, or rejected).
+     */
+    async fulfilmentGate(orderId: number): Promise<{ orderId: number; assessed: boolean; held: boolean; caseStatus: string | null; releasable: boolean }> {
+        const assessed = await this.isAssessed(orderId);
+        const [c] = await this.db.query(
+            `SELECT bo.status, fc.holdFulfilment FROM fraud_blocked_orders bo LEFT JOIN fraud_config fc ON fc.channelId = bo.channelId
+             WHERE bo.orderId = ? ORDER BY bo.id DESC LIMIT 1`, [orderId],
+        ).catch(() => []);
+        const status: string | null = c?.status || null;
+        const holdOn = c ? (c.holdFulfilment == null || Number(c.holdFulfilment) !== 0) : true;
+        const held = status === 'rejected' || (status === 'pending' && holdOn);
+        return { orderId, assessed, held, caseStatus: status, releasable: assessed && !held };
+    }
+
+    /** Latest risk per order for the admin orders-list column (one query, at most 100 ids). */
+    async orderRisk(orderIds: number[]): Promise<Record<string, { score: number; level: string; action: string; caseStatus: string | null }>> {
+        const ids = Array.from(new Set(orderIds.map(Number).filter(n => Number.isInteger(n) && n > 0))).slice(0, 100);
+        if (!ids.length) return {};
+        const ph = ids.map(() => '?').join(',');
+        const rows = await this.db.query(
+            `SELECT l.orderId, l.riskScore, l.riskLevel, l.action FROM fraud_log l
+             JOIN (SELECT orderId, MAX(id) AS maxId FROM fraud_log
+                   WHERE orderId IN (${ph}) AND action IN ('allow', 'flag', 'hold', 'review', 'block', 'shadow', 'refused', 'unpaid')
+                   GROUP BY orderId) m ON m.maxId = l.id`,
+            ids,
+        ).catch(() => []);
+        const cases = await this.db.query(
+            `SELECT orderId, status FROM fraud_blocked_orders WHERE orderId IN (${ph}) ORDER BY id`, ids,
+        ).catch(() => []);
+        const out: Record<string, { score: number; level: string; action: string; caseStatus: string | null }> = {};
+        for (const r of rows) out[String(r.orderId)] = { score: Number(r.riskScore), level: r.riskLevel, action: r.action, caseStatus: null };
+        for (const c of cases) if (out[String(c.orderId)]) out[String(c.orderId)].caseStatus = c.status;
+        return out;
     }
 
     /**
@@ -1160,7 +1366,7 @@ export class FraudPreventionService implements OnModuleInit {
      */
     async isAssessed(orderId: ID | number): Promise<boolean> {
         const rows = await this.db.query(
-            `SELECT 1 AS present FROM fraud_log WHERE orderId = ? LIMIT 1`, [Number(orderId)],
+            `SELECT 1 AS present FROM fraud_log WHERE orderId = ? AND action NOT IN ('refused', 'unpaid') LIMIT 1`, [Number(orderId)],
         ).catch(() => []);
         return rows.length > 0;
     }
@@ -1171,7 +1377,7 @@ export class FraudPreventionService implements OnModuleInit {
         const ids = Array.from(new Set(orderIds.map(id => Number(id)).filter(n => Number.isFinite(n))));
         if (!ids.length) return [];
         const rows = await this.db.query(
-            `SELECT DISTINCT orderId FROM fraud_log WHERE orderId IN (${ids.map(() => '?').join(',')})`, ids,
+            `SELECT DISTINCT orderId FROM fraud_log WHERE orderId IN (${ids.map(() => '?').join(',')}) AND action NOT IN ('refused', 'unpaid')`, ids,
         ).catch(() => []);
         return rows.map((r: any) => Number(r.orderId));
     }
@@ -1213,7 +1419,7 @@ export class FraudPreventionService implements OnModuleInit {
         id: number,
         decision: 'approved' | 'rejected',
         notes?: string,
-        opts: { cancel?: boolean; refund?: boolean } = {},
+        opts: { cancel?: boolean; refund?: boolean; capture?: boolean; auto?: boolean } = {},
     ): Promise<ResolveCaseResult> {
         const rows = await this.db.query(`SELECT * FROM fraud_blocked_orders WHERE id = ?`, [id]);
         if (!rows.length) return { ok: false, message: 'Case not found' };
@@ -1232,6 +1438,16 @@ export class FraudPreventionService implements OnModuleInit {
             return { ok: false, message: `Already ${now?.status || 'decided'}` };
         }
         const result: ResolveCaseResult = { ok: true, message: `Case ${decision}`, caseRow: c };
+        if (decision === 'approved' && c.orderId) {
+            // Premium: approving captures what the hold left authorised. Without premium the
+            // approval still releases the order and says what is left to settle by hand.
+            const wantCapture = opts.capture ?? this.options.captureOnApprove ?? true;
+            if (wantCapture) {
+                const outcome = await this.captureApprovedOrder(Number(c.orderId), Number(c.channelId), premiumActive());
+                if (outcome.captured.length) result.captured = outcome.captured;
+                if (outcome.warnings.length) result.warnings = outcome.warnings;
+            }
+        }
         if (decision === 'rejected' && c.orderId) {
             const cancel = opts.cancel ?? this.options.cancelOnReject ?? true;
             const refund = opts.refund ?? this.options.refundOnReject ?? true;
@@ -1251,11 +1467,43 @@ export class FraudPreventionService implements OnModuleInit {
             [c.channelId, c.orderId, c.orderCode, c.ip, c.email, c.riskScore, decision,
                 this.describeResolution(decision, notes, result), decision],
         );
+        this.publish(new FraudCaseResolvedEvent(Number(id), decision, c.orderId ? Number(c.orderId) : null, c.orderCode || null, {
+            captured: result.captured, cancelled: result.cancelled, refunds: result.refunds, warnings: result.warnings, auto: !!opts.auto,
+        }));
         return result;
+    }
+
+    /**
+     * Settle the order's Authorized payments after an approval (a manual-
+     * capture card hold, for example). `premium` false: nothing is captured;
+     * each authorised payment is reported as a warning instead.
+     */
+    private async captureApprovedOrder(orderId: number, channelId: number, premium: boolean): Promise<{ captured: number[]; warnings: string[] }> {
+        const captured: number[] = [];
+        const warnings: string[] = [];
+        try {
+            const ctx = await this.adminContextForOrder(orderId, channelId);
+            const order = await this.orderService.findOne(ctx, orderId, ['payments']);
+            const authorised = (order?.payments || []).filter(p => p.state === 'Authorized');
+            for (const p of authorised) {
+                if (!premium) {
+                    warnings.push(`payment #${p.id} is still authorised: settle it from the order page (capture on approve needs a licence)`);
+                    continue;
+                }
+                const r: any = await this.orderService.settlePayment(ctx, p.id);
+                if (r && r.errorCode) warnings.push(`capture payment #${p.id}: ${r.message || r.errorCode}`);
+                else captured.push(Number(p.id));
+            }
+        } catch (e: any) {
+            warnings.push(`capture threw: ${e?.message || e}`);
+        }
+        for (const w of warnings) Logger.warn(`Fraud approve for order #${orderId}: ${w}`, loggerCtx);
+        return { captured, warnings };
     }
 
     private describeResolution(decision: string, notes: string | undefined, r: ResolveCaseResult): string {
         const parts = [notes || `${decision} by admin`];
+        for (const id of r.captured || []) parts.push(`payment #${id} captured`);
         if (r.cancelled) parts.push('order cancelled');
         for (const rf of r.refunds || []) parts.push(`refunded ${(rf.amount / 100).toFixed(2)} on payment #${rf.paymentId}`);
         for (const w of r.warnings || []) parts.push(`warning: ${w}`);
@@ -1424,6 +1672,9 @@ export class FraudPreventionService implements OnModuleInit {
         const [pending] = await this.db.query(
             `SELECT COUNT(*) AS n FROM fraud_blocked_orders WHERE status = 'pending'`,
         );
+        const [refused] = await this.db.query(
+            `SELECT COUNT(*) AS n FROM fraud_log WHERE action = 'refused' AND createdAt > DATE_SUB(NOW(), INTERVAL ? DAY)`, [d],
+        ).catch(() => [{ n: 0 }]);
         const [orders24] = await this.db.query(
             `SELECT COUNT(*) AS totalOrders, COUNT(DISTINCT \`customFieldsIp\`) AS uniqueIps,
                     COALESCE(SUM(\`subTotalWithTax\`), 0) AS totalValue
@@ -1444,6 +1695,7 @@ export class FraudPreventionService implements OnModuleInit {
         return {
             totals: totals || {}, daily, byLevel: topSignals,
             pendingCases: Number(pending?.n || 0),
+            refused: Number(refused?.n || 0),
             orders24: orders24 || {}, failedPayments24: Number(failed24?.n || 0),
             topIps,
             intercepted30: { held: last30.ordersHeld, blocked: last30.ordersBlocked, riskyValuePence: last30.riskyValuePence },
@@ -1478,6 +1730,336 @@ export class FraudPreventionService implements OnModuleInit {
             await this.db.query(`DELETE FROM fraud_log WHERE id IN (${ids.map(() => '?').join(',')})`, ids);
             removed += ids.length;
         }
+    }
+
+
+    // ── Install-wide settings (Settings tab) ─────────────────────────────
+    private async ipIntelKey(): Promise<string | null> {
+        if (this.options.ipApiKey) return this.options.ipApiKey;
+        return this.cached('ipIntelKey', 30_000, () => this.prefs.get('ipIntel.key'));
+    }
+
+    async getGeneralSettings(): Promise<GeneralSettings> {
+        return this.cached('general', 30_000, async () => {
+            const p = await this.prefs.all();
+            const key = this.options.ipApiKey || p['ipIntel.key'] || '';
+            const saved = p['log.retentionDays'];
+            const days = saved != null && saved !== '' && Number.isFinite(Number(saved))
+                ? Number(saved) : (this.options.logRetentionDays ?? 180);
+            return {
+                ipIntelEnabled: p['ipIntel.enabled'] === 'on',
+                ipIntelKeySet: !!key,
+                ipIntelKeyHint: key ? `…${key.slice(-4)}` : null,
+                ipIntelKeyFromOptions: !!this.options.ipApiKey,
+                logRetentionDays: Math.max(0, Math.floor(days)),
+            };
+        });
+    }
+
+    /** `ipIntelKey`: a string sets it, null/'' clears it, undefined leaves it. */
+    async saveGeneralSettings(patch: { ipIntelEnabled?: boolean; ipIntelKey?: string | null; logRetentionDays?: number | null }): Promise<GeneralSettings> {
+        if (typeof patch.ipIntelEnabled === 'boolean') await this.prefs.set('ipIntel.enabled', patch.ipIntelEnabled ? 'on' : 'off');
+        if (patch.ipIntelKey !== undefined) {
+            const k = String(patch.ipIntelKey ?? '').trim();
+            if (k && !/^[A-Za-z0-9_-]{6,128}$/.test(k)) throw new Error('That does not look like an ip-api.com key');
+            await this.prefs.set('ipIntel.key', k || null);
+        }
+        if (patch.logRetentionDays !== undefined) {
+            if (patch.logRetentionDays === null) {
+                await this.prefs.set('log.retentionDays', null);
+            } else {
+                const d = Number(patch.logRetentionDays);
+                if (!Number.isInteger(d) || d < 0 || d > 3650) throw new Error('Retention must be 0 (keep forever) to 3650 days');
+                await this.prefs.set('log.retentionDays', String(d));
+            }
+        }
+        this.forget('general'); this.forget('ipIntelKey');
+        return this.getGeneralSettings();
+    }
+
+    // ── Velocity helpers ───────────────────────────────────────────────
+    /** Orders from this address that were refused before the charge or left
+     *  unpaid (they never got orderPlacedAt, so the placed-order counts miss
+     *  them), last hour and last 24 h, one per order. */
+    private async unplacedAttemptsByIp(ip: string, excludeOrderId?: number): Promise<{ hour: number; day: number }> {
+        const params: any[] = [ip];
+        let exclude = '';
+        if (excludeOrderId) { exclude = ' AND (l.orderId IS NULL OR l.orderId <> ?)'; params.push(excludeOrderId); }
+        const [row] = await this.db.query(
+            `SELECT COUNT(DISTINCT CASE WHEN l.createdAt > DATE_SUB(NOW(), INTERVAL 1 HOUR) THEN COALESCE(l.orderId, -l.id) END) AS hourCnt,
+                    COUNT(DISTINCT COALESCE(l.orderId, -l.id)) AS dayCnt
+             FROM fraud_log l LEFT JOIN \`order\` o ON o.id = l.orderId
+             WHERE l.ip = ? AND l.action IN ('refused', 'unpaid')
+               AND l.createdAt > DATE_SUB(NOW(), INTERVAL 24 HOUR) AND o.\`orderPlacedAt\` IS NULL${exclude}`,
+            params,
+        ).catch(() => [null]);
+        return { hour: Number(row?.hourCnt || 0), day: Number(row?.dayCnt || 0) };
+    }
+
+    /**
+     * Failed payments from an address: in the last hour, in the last
+     * (60 + cooldown) minutes, and whether it is cooling down — it reached
+     * maxFailedPaymentsPerIpPerHour and its latest failure is less than
+     * cooldownMinutesAfterFailedPayment old. Counts Vendure Payment rows and
+     * checkout-guard declines.
+     */
+    async failedPaymentState(ip: string, cfg: FraudChannelConfig): Promise<{ hour: number; window: number; guard: number; coolingDown: boolean }> {
+        const cooldown = Math.max(0, Math.min(Math.floor(Number(cfg.cooldownMinutesAfterFailedPayment) || 0), 24 * 60));
+        const windowMins = 60 + cooldown;
+        const recentMins = Math.max(1, cooldown);
+        const [v] = await this.db.query(
+            `SELECT SUM(CASE WHEN p.\`createdAt\` > DATE_SUB(NOW(), INTERVAL 1 HOUR) THEN 1 ELSE 0 END) AS hourCnt,
+                    COUNT(*) AS winCnt,
+                    SUM(CASE WHEN p.\`createdAt\` > DATE_SUB(NOW(), INTERVAL ? MINUTE) THEN 1 ELSE 0 END) AS recentCnt
+             FROM payment p JOIN \`order\` o ON o.id = p.\`orderId\`
+             WHERE o.\`customFieldsIp\` = ? AND p.state IN ('Declined', 'Error', 'Cancelled')
+               AND p.\`createdAt\` > DATE_SUB(NOW(), INTERVAL ? MINUTE)`,
+            [recentMins, ip, windowMins],
+        ).catch(() => [null]);
+        let g: any = null;
+        if (await this.checkoutGuardTableExists()) {
+            [g] = await this.db.query(
+                `SELECT SUM(CASE WHEN createdAt > DATE_SUB(NOW(), INTERVAL 1 HOUR) THEN 1 ELSE 0 END) AS hourCnt,
+                        COUNT(*) AS winCnt,
+                        SUM(CASE WHEN createdAt > DATE_SUB(NOW(), INTERVAL ? MINUTE) THEN 1 ELSE 0 END) AS recentCnt
+                 FROM checkout_guard_payment_event
+                 WHERE ip = ? AND kind IN ('failed', 'client_declined') AND createdAt > DATE_SUB(NOW(), INTERVAL ? MINUTE)`,
+                [recentMins, ip, windowMins],
+            ).catch(() => [null]);
+        }
+        const guard = Number(g?.hourCnt || 0);
+        const hour = Number(v?.hourCnt || 0) + guard;
+        const window = Number(v?.winCnt || 0) + Number(g?.winCnt || 0);
+        const recent = Number(v?.recentCnt || 0) + Number(g?.recentCnt || 0);
+        const max = Number(cfg.maxFailedPaymentsPerIpPerHour) || 0;
+        const coolingDown = cooldown > 0 && max > 0 && window >= max && recent > 0;
+        return { hour, window, guard, coolingDown };
+    }
+
+    // ── Misconfigured-proxy detection ───────────────────────────────────
+    private proxySeen = new Map<string, { header: string; at: number; clients: Map<string, number> }>();
+    private proxyPersistAt = 0;
+
+    /**
+     * Called from the storefront requests the plugin sees (the pre-charge
+     * check and the public /check). When a peer sends forwarding headers that
+     * were ignored — it is not a trusted proxy — the peer and a hash of the
+     * client it named are remembered for a week. A peer that forwarded for
+     * PROXY_HINT_MIN_CLIENTS different public clients is pointed out on the
+     * Overview tab: behind it, every customer is scored with its address.
+     */
+    noteIgnoredForwarding(req: ClientIpRequest | undefined | null, opts: ClientIpOptions): void {
+        try {
+            if (!req) return;
+            const seen = ignoredForwarding(req, opts);
+            if (!seen) return;
+            const now = Date.now();
+            const p = this.proxySeen.get(seen.peer) || { header: seen.header, at: now, clients: new Map<string, number>() };
+            p.header = seen.header;
+            p.at = now;
+            const h = createHash('sha256').update(seen.client).digest('hex').slice(0, 12);
+            const isNew = !p.clients.has(h) && p.clients.size < 10;
+            p.clients.set(h, now);
+            this.proxySeen.set(seen.peer, p);
+            if (this.proxySeen.size > 20) this.proxySeen.delete(this.proxySeen.keys().next().value as string);
+            // Persist when something new was seen, else at most hourly.
+            if (isNew || now - this.proxyPersistAt > 3_600_000) {
+                this.proxyPersistAt = now;
+                void this.persistProxySeen().catch(() => undefined);
+            }
+        } catch { /* never affects the request */ }
+    }
+
+    private async persistProxySeen(): Promise<void> {
+        const stored = await this.loadProxySeen();
+        for (const [peer, p] of this.proxySeen) {
+            const prev = stored[peer] || { header: p.header, at: 0, seen: {} as Record<string, number> };
+            const merged: Record<string, number> = { ...prev.seen };
+            for (const [h, at] of p.clients) merged[h] = at;
+            const top = Object.entries(merged).sort((a, b) => b[1] - a[1]).slice(0, 10);
+            stored[peer] = { header: p.header, at: p.at, seen: Object.fromEntries(top) };
+        }
+        const peers = Object.entries(stored).sort((a, b) => b[1].at - a[1].at).slice(0, 5);
+        await this.prefs.set('proxyHint.peers', JSON.stringify(Object.fromEntries(peers)));
+    }
+
+    private async loadProxySeen(): Promise<Record<string, { header: string; at: number; seen: Record<string, number> }>> {
+        try {
+            const raw = await this.prefs.get('proxyHint.peers');
+            const v = raw ? JSON.parse(raw) : {};
+            const weekAgo = Date.now() - 7 * 86_400_000;
+            const out: Record<string, { header: string; at: number; seen: Record<string, number> }> = {};
+            for (const [peer, p] of Object.entries<any>(v || {})) {
+                if (!p || Number(p.at) < weekAgo) continue;
+                out[peer] = { header: String(p.header || 'x-forwarded-for'), at: Number(p.at), seen: p.seen && typeof p.seen === 'object' ? p.seen : {} };
+            }
+            return out;
+        } catch { return {}; }
+    }
+
+    private async dismissedProxies(): Promise<Record<string, number>> {
+        try { const raw = await this.prefs.get('proxyHint.dismissed'); return raw ? JSON.parse(raw) || {} : {}; } catch { return {}; }
+    }
+
+    /** The notice for the Overview tab, or null. */
+    async proxyHint(trusted: string[] = []): Promise<ProxyHint | null> {
+        await this.persistProxySeen().catch(() => undefined);
+        const stored = await this.loadProxySeen();
+        const dismissed = await this.dismissedProxies();
+        const peers: string[] = [];
+        const clients = new Set<string>();
+        let header = '';
+        for (const [peer, p] of Object.entries(stored).sort((a, b) => b[1].at - a[1].at)) {
+            if (dismissed[peer] || trusted.some(t => ipInCidr(peer, t))) continue;
+            peers.push(peer);
+            header = header || p.header;
+            for (const h of Object.keys(p.seen)) clients.add(h);
+        }
+        if (!peers.length || clients.size < PROXY_HINT_MIN_CLIENTS) return null;
+        return { peers: peers.slice(0, 3), header, clients: clients.size };
+    }
+
+    /** "Not my proxy": the peers shown are never pointed out again. */
+    async dismissProxyHint(trusted: string[] = []): Promise<void> {
+        const hint = await this.proxyHint(trusted);
+        if (!hint) return;
+        const d = await this.dismissedProxies();
+        for (const ip of hint.peers) d[ip] = Date.now();
+        const top = Object.entries(d).sort((a, b) => b[1] - a[1]).slice(0, 50);
+        await this.prefs.set('proxyHint.dismissed', JSON.stringify(Object.fromEntries(top)));
+    }
+
+    // ── Pre-charge check (Hold / Enforce) ─────────────────────────────────
+    /**
+     * Score an order on its move to ArrangingPayment, before any payment is
+     * taken. In hold or enforce mode (enforce falls back to hold without a
+     * licence) a block-level score, or an address in its failed-payment
+     * cooldown, is refused: the transition fails with a neutral message and
+     * the attempt is logged as `refused`. Everything else passes and nothing
+     * is logged (the order is scored again, in full, once placed).
+     * Fails OPEN: any internal error lets the order through.
+     */
+    async preChargeCheck(ctx: RequestContext, order: Order): Promise<{ allowed: boolean; message?: string; assessment?: FraudAssessment }> {
+        try {
+            if (this.options.preChargeCheck === false) return { allowed: true };
+            const channelId = Number(ctx.channelId || 1);
+            const cfg = await this.getConfig(channelId);
+            if (!cfg.enabled || cfg.mode === 'off' || cfg.mode === 'monitor') return { allowed: true };
+            const ipOpts = { trustedProxies: this.options.trustedProxies, trustCloudflareHeader: this.options.trustCloudflareHeader };
+            const req: any = (ctx as any).req;
+            this.noteIgnoredForwarding(req, ipOpts);
+            const ip = normaliseIp((order.customFields as any)?.ip) || (req ? clientIpFromRequest(req, ipOpts) : '') || undefined;
+            let email = order.customer?.emailAddress || '';
+            if (!email && (order as any).customerId) {
+                const [c] = await this.db.query(`SELECT \`emailAddress\` AS emailAddress FROM customer WHERE id = ?`, [Number((order as any).customerId)]).catch(() => []);
+                email = c?.emailAddress || '';
+            }
+            const input: AssessInput = {
+                channelId, ip, email,
+                orderValuePence: order.subTotalWithTax || 0,
+                currencyCode: (order as any).currencyCode,
+                countryCode: order.billingAddress?.countryCode || order.shippingAddress?.countryCode || undefined,
+                shippingCountryCode: order.shippingAddress?.countryCode || undefined,
+                billingPostalCode: order.billingAddress?.postalCode || undefined,
+                shippingPostalCode: order.shippingAddress?.postalCode || undefined,
+                orderId: Number(order.id), orderCode: order.code,
+                unplaced: true,
+            };
+            const a = await this.assess(input);
+            if (a.allowlisted || a.protectionActive === false) return { allowed: true, assessment: a };
+            const blockLevel = a.level === 'blocked' && (a.action === 'hold' || a.action === 'block');
+            const cooling = !blockLevel && ip ? (await this.failedPaymentState(ip, cfg)).coolingDown : false;
+            this.publish(new FraudAssessedEvent(ctx, this.subjectOf(input), a, 'pre-charge', blockLevel || cooling ? 'refused' : 'passed'));
+            if (!blockLevel && !cooling) return { allowed: true, assessment: a };
+            const logged: FraudAssessment = { ...a, signals: cooling && !blockLevel
+                ? [...a.signals, { key: 'failed_payment_cooldown', label: 'Failed-payment cooldown', points: 0, detail: `address in its ${cfg.cooldownMinutesAfterFailedPayment}-minute cooldown after repeated failed payments` }]
+                : a.signals };
+            await this.logAssessment(input, logged, 'refused');
+            this.publish(new FraudPaymentRefusedEvent(ctx, this.subjectOf(input), a, blockLevel ? 'block-level' : 'failed-payment-cooldown'));
+            Logger.warn(`Order ${order.code} refused before payment (score ${a.score}/100, ${blockLevel ? 'block level' : 'failed-payment cooldown'})`, loggerCtx);
+            void this.alertRefused(input, a, blockLevel ? 'block-level' : 'failed-payment-cooldown');
+            return {
+                allowed: false, assessment: a,
+                message: cooling && !blockLevel
+                    ? 'We could not accept a payment from this connection right now. Please try again later or contact us.'
+                    : 'We could not accept this order. Please contact us if you think this is a mistake.',
+            };
+        } catch (e: any) {
+            Logger.warn(`Pre-charge check failed open for ${order?.code}: ${e?.message || e}`, loggerCtx);
+            return { allowed: true };
+        }
+    }
+
+    /** Premium alert for a refusal (e-mail + chat); silent on the free tier. */
+    private async alertRefused(input: AssessInput, a: FraudAssessment, reason: string): Promise<void> {
+        try {
+            const money = formatMinor(input.orderValuePence, input.currencyCode);
+            await this.notifyOps({
+                event: 'payment.refused',
+                text: `⛔ Order ${input.orderCode || ''} from ${input.email || 'unknown'} refused before payment (${reason}, score ${a.score}/100).`,
+                orderCode: input.orderCode, email: input.email, score: a.score, level: a.level,
+                signals: a.signals.map(sg => ({ key: sg.key, label: sg.label, points: sg.points })),
+            });
+            const notif = await this.getNotificationConfig();
+            if (notif.notifyOnBlocked) {
+                await this.sendAdminAlert(`Order ${input.orderCode || ''} refused before payment (score ${a.score})`,
+                    `<h2>⛔ Order refused before payment</h2>
+                     <p><strong>Order:</strong> ${esc(input.orderCode || '')} (${esc(money)})</p>
+                     <p><strong>Customer:</strong> ${esc(input.email || '')}</p>
+                     <p><strong>Reason:</strong> ${reason === 'block-level' ? `risk score ${a.score}/100 (block level)` : 'failed-payment cooldown'}</p>
+                     <ul>${a.signals.map(sg => `<li>${esc(sg.label)} (+${sg.points}): ${esc(sg.detail)}</li>`).join('')}</ul>
+                     <p>No payment was taken.</p>`);
+            }
+        } catch { /* alerts never affect the order */ }
+    }
+
+    // ── Unpaid orders ──────────────────────────────────────────────────
+    /**
+     * Orders that reached ArrangingPayment and were never placed (abandoned,
+     * or every payment failed) are scored once after a 15-minute grace and
+     * logged as `unpaid`, so velocity counts the attempt and the order shows
+     * its score. No case, no hold, no alert. If the order is placed later it
+     * is scored again in full.
+     */
+    async scoreUnpaidOrders(limit = 100): Promise<number> {
+        const rows = await this.db.query(
+            `SELECT o.id FROM \`order\` o
+             WHERE o.state = 'ArrangingPayment' AND o.active = TRUE AND o.\`orderPlacedAt\` IS NULL
+               AND o.\`customerId\` IS NOT NULL
+               AND o.\`updatedAt\` < DATE_SUB(NOW(), INTERVAL 15 MINUTE)
+               AND o.\`updatedAt\` > DATE_SUB(NOW(), INTERVAL 24 HOUR)
+               AND NOT EXISTS (SELECT 1 FROM fraud_log l WHERE l.orderId = o.id)
+             ORDER BY o.id LIMIT ${Math.max(1, Math.min(limit, 500))}`,
+        ).catch(() => []);
+        let n = 0;
+        for (const r of rows) {
+            try {
+                const [o] = await this.db.query(
+                    `SELECT o.id, o.code, o.\`subTotalWithTax\` AS subTotalWithTax, o.\`currencyCode\` AS currencyCode, o.\`customFieldsIp\` AS ip,
+                            c.\`emailAddress\` AS email,
+                            (SELECT oc.\`channelId\` FROM order_channels_channel oc WHERE oc.\`orderId\` = o.id ORDER BY oc.\`channelId\` DESC LIMIT 1) AS channelId
+                     FROM \`order\` o LEFT JOIN customer c ON c.id = o.\`customerId\` WHERE o.id = ?`, [Number(r.id)],
+                ).catch(() => []);
+                if (!o) continue;
+                const input: AssessInput = {
+                    channelId: Number(o.channelId || 1), ip: normaliseIp(o.ip) || undefined, email: o.email || '',
+                    orderValuePence: Number(o.subTotalWithTax || 0), currencyCode: o.currencyCode || undefined,
+                    orderId: Number(o.id), orderCode: o.code, unplaced: true,
+                };
+                const a = await this.assess(input);
+                await this.logAssessment(input, a, 'unpaid');
+                this.publish(new FraudAssessedEvent(undefined, this.subjectOf(input), a, 'unpaid', 'unpaid'));
+                n++;
+            } catch (e: any) {
+                Logger.debug(`Unpaid scoring failed for order #${r.id}: ${e?.message}`, loggerCtx);
+            }
+        }
+        return n;
+    }
+
+    /** Retention in force: the Settings tab value, else the init option, else 180. */
+    async effectiveRetentionDays(): Promise<number> {
+        return (await this.getGeneralSettings().catch(() => null))?.logRetentionDays ?? (this.options.logRetentionDays ?? 180);
     }
 
     // ── Lists ──────────────────────────────────────────────────────────
@@ -1801,7 +2383,10 @@ export class FraudPreventionService implements OnModuleInit {
                 isVpnOrProxy: !!rows[0].isVpnOrProxy, isHosting: !!rows[0].isHosting, resolved: true,
             };
         }
-        const intel = await lookupIpIntel(ip);
+        // Opt-in: no lookup unless IP intelligence is on and an ip-api.com Pro key is set.
+        const general = await this.getGeneralSettings().catch(() => null);
+        if (!general?.ipIntelEnabled) return { ip, countryCode: null, isVpnOrProxy: false, isHosting: false, resolved: false };
+        const intel = await lookupIpIntel(ip, { apiKey: await this.ipIntelKey() });
         if (intel.resolved) {
             await this.db.query(
                 `INSERT INTO fraud_ip_intel (ip, countryCode, isVpnOrProxy, isHosting, checkedAt)
@@ -1907,7 +2492,7 @@ export class FraudPreventionService implements OnModuleInit {
             ).catch(() => []);
             for (const row of stale) {
                 const r = await this.resolveCase(Number(row.id), 'approved',
-                    `auto-approved after ${cfg.autoApproveAfterHours}h unreviewed`);
+                    `auto-approved after ${cfg.autoApproveAfterHours}h unreviewed`, { auto: true });
                 if (r.ok) {
                     released++;
                     Logger.warn(`Fraud case #${row.id} auto-approved after ${cfg.autoApproveAfterHours}h`, loggerCtx);
@@ -1927,7 +2512,9 @@ export class FraudPreventionService implements OnModuleInit {
     }
 
     // ── Ops notifications (Slack / Discord / Teams / Telegram / webhook) ─
+    /** Chat / webhook alerts are premium (licence or evaluation), like the e-mail alerts. */
     async notifyOps(ev: OpsEvent): Promise<void> {
+        if (!premiumActive()) return;
         try {
             const rows = await this.db.query(`SELECT * FROM fraud_notification_config LIMIT 1`).catch(() => []);
             if (!rows.length) return;
@@ -2078,7 +2665,9 @@ export class FraudPreventionService implements OnModuleInit {
         ]).finally(() => clearTimeout(timer));
     }
 
+    /** Admin e-mail alerts are premium (licence or evaluation); they stop when it lapses. */
     async sendAdminAlert(subject: string, html: string): Promise<void> {
+        if (!premiumActive()) return;
         try {
             const smtp = this.smtpSettings();
             if (!smtp) return;

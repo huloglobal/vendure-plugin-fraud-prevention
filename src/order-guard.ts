@@ -2,16 +2,20 @@ import { Injectable, OnApplicationBootstrap } from '@nestjs/common';
 import { EventBus, Logger, OrderPlacedEvent, ProcessContext } from '@vendure/core';
 import { FraudPreventionService, AssessInput } from './fraud-prevention.service';
 import { normaliseIp } from './net-util';
+import { FraudAssessedEvent } from './events';
 
 const loggerCtx = 'FraudPrevention';
+const esc = (v: unknown) => String(v ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c] as string));
 
 /**
  * The enforcement point the old implementation never had: every placed
  * order is assessed server-side. What happens then depends on the
  * channel's mode:
  *
- *   off      -> nothing, not even a log row
+ *   off      -> scored and logged as 'shadow', nothing else
  *   monitor  -> assessment logged; flagged orders marked 'flag' but never held
+ *   hold     -> as monitor once placed (block-level orders were already
+ *               refused before the charge by the pre-charge check)
  *   enforce  -> score >= reviewThreshold opens a pending review case
  *               (hosts gate fulfilment on pendingOrderIds()); score >=
  *               blockThreshold additionally tells the customer the order
@@ -59,6 +63,7 @@ export class FraudOrderGuard implements OnApplicationBootstrap {
             ip: normaliseIp((order.customFields as any)?.ip) || undefined,
             email,
             orderValuePence: order.subTotalWithTax || 0,
+            currencyCode: (order as any).currencyCode || undefined,
             countryCode: order.billingAddress?.countryCode || order.shippingAddress?.countryCode || undefined,
             shippingCountryCode: order.shippingAddress?.countryCode || undefined,
             billingPostalCode: order.billingAddress?.postalCode || undefined,
@@ -72,6 +77,8 @@ export class FraudOrderGuard implements OnApplicationBootstrap {
         };
 
         const assessment = await this.service.assess(input);
+        // Hold mode acts before the charge only: a placed order is paid, so a risky one is flagged.
+        if (assessment.action === 'hold') assessment.action = 'flag';
 
         // In enforce mode the review case is written BEFORE the assessment log: the host
         // fulfilment gate treats "assessed and no case" as releasable, so the case must exist
@@ -82,6 +89,7 @@ export class FraudOrderGuard implements OnApplicationBootstrap {
         // Always log — shadow assessments included, so the score history
         // has no blind spots even while protection is switched off.
         await this.service.logAssessment(input, assessment);
+        this.service.publish(new FraudAssessedEvent(event.ctx, this.service.subjectOf(input), assessment, 'placed', assessment.action));
 
         if (assessment.protectionActive === false) {
             if (assessment.action === 'shadow') {
@@ -121,10 +129,32 @@ export class FraudOrderGuard implements OnApplicationBootstrap {
         if (assessment.action === 'allow' || assessment.action === 'flag') {
             if (assessment.action === 'flag') {
                 Logger.warn(
-                    `Order ${order.code} flagged (score ${assessment.score}, monitor mode): ` +
+                    `Order ${order.code} flagged (score ${assessment.score}, ${assessment.mode} mode): ` +
                     assessment.signals.map(s => s.label).join(', '),
                     loggerCtx,
                 );
+                // Monitor-mode alerts (premium; sendAdminAlert / notifyOps are silent on the free tier).
+                const notif = await this.service.getNotificationConfig();
+                await this.service.notifyOps({
+                    event: 'order.flagged',
+                    text: `⚠️ Order ${order.code} flagged — score ${assessment.score}/100 (${assessment.level}), not held. ` +
+                        assessment.signals.map(s => s.label).join(', '),
+                    orderCode: order.code, email, score: assessment.score, level: assessment.level,
+                    signals: assessment.signals.map(s => ({ key: s.key, label: s.label, points: s.points })),
+                });
+                if (notif.notifyOnHighRisk) {
+                    const base = this.service.getOptions().publicBaseUrl || '';
+                    void this.service.sendAdminAlert(
+                        `Order ${order.code} flagged (score ${assessment.score})`,
+                        `<h2>⚠️ Risky order flagged</h2>
+                         <p><strong>Order:</strong> ${esc(order.code)}</p>
+                         <p><strong>Customer:</strong> ${esc(email)}</p>
+                         <p><strong>Risk score:</strong> ${assessment.score}/100 (${assessment.level})</p>
+                         <ul>${assessment.signals.map(s => `<li>${esc(s.label)} (+${s.points}): ${esc(s.detail)}</li>`).join('')}</ul>
+                         <p>It is <strong>not</strong> in the review queue (${assessment.mode} mode). Check it before you fulfil it.</p>
+                         ${base ? `<p><a href="${base}/admin/orders/${order.id}">Open the order →</a></p>` : ''}`,
+                    );
+                }
             }
             return;
         }

@@ -72,6 +72,10 @@ export interface CardChecks {
     threeDsAuthenticated?: boolean;
     /** `three_d_secure.result` when the gateway reports one. */
     threeDsResult?: ThreeDsResult;
+    /** Issuer verdict on the card security code (CVC / CVV). */
+    cvc?: AvsCheck;
+    /** ISO 3166-1 alpha-2 country the card was issued in. */
+    cardCountry?: string;
     /** Where the result came from — shown in the signal detail. */
     source?: string;
 }
@@ -154,10 +158,16 @@ export function threeDsFailed(checks: CardChecks | null | undefined): boolean {
     return true;
 }
 
+/** A two-letter country code, upper-cased, or null. */
+export function parseCountry(v: unknown): string | null {
+    const c = String(v ?? '').trim().toUpperCase();
+    return /^[A-Z]{2}$/.test(c) ? c : null;
+}
+
 /** True when the object carries at least one usable verdict. */
 function hasAnyCheck(c: CardChecks): boolean {
     return c.postalCode !== undefined || c.line1 !== undefined || c.riskLevel !== undefined
-        || c.threeDsAuthenticated !== undefined;
+        || c.threeDsAuthenticated !== undefined || c.cvc !== undefined || c.cardCountry !== undefined;
 }
 
 /** Read every card check out of a Stripe Charge object (or anything
@@ -176,7 +186,11 @@ export function cardChecksFromStripeCharge(charge: any): CardChecks | null {
         const line1 = parseAvsCheck(checks.address_line1_check);
         if (postalCode) out.postalCode = postalCode;
         if (line1) out.line1 = line1;
+        const cvc = parseAvsCheck(checks.cvc_check);
+        if (cvc) out.cvc = cvc;
     }
+    const country = parseCountry(card?.country);
+    if (country) out.cardCountry = country;
 
     const riskLevel = parseRiskLevel(charge?.outcome?.risk_level);
     if (riskLevel) out.riskLevel = riskLevel;
@@ -233,6 +247,11 @@ export function avsFromMetadata(metadata: any, source = 'payment metadata'): Car
             break;
         }
     }
+
+    const cvc = parseAvsCheck(m.avs?.cvc ?? m.card?.cvc ?? m.checks?.cvc_check ?? m.cvc_check ?? m.cvcCheck);
+    if (cvc) out.cvc = cvc;
+    const cardCountry = parseCountry(m.avs?.cardCountry ?? m.card?.cardCountry ?? m.card?.country ?? m.cardCountry ?? m.card_country);
+    if (cardCountry) out.cardCountry = cardCountry;
 
     const riskLevel = parseRiskLevel(
         m.avs?.riskLevel ?? m.card?.riskLevel ?? m.radarRiskLevel ?? m.risk_level ?? m.outcome?.risk_level,
@@ -347,6 +366,18 @@ export function describeRadar(result: CardChecks): string {
     const score = result.riskScore != null ? `, risk score ${result.riskScore}` : '';
     const via = result.source ? ` (${result.source})` : '';
     return `Stripe Radar rated this charge "${result.riskLevel}"${score}${via}`;
+}
+
+/** Detail wording for the CVC signal. */
+export function describeCvc(result: CardChecks): string {
+    const via = result.source ? ` (${result.source})` : '';
+    return `Card issuer reports the CVC does not match${via}`;
+}
+
+/** Detail wording for the card-country signal. */
+export function describeCardCountry(result: CardChecks, billingCountry: string): string {
+    const via = result.source ? ` (${result.source})` : '';
+    return `Card issued in ${result.cardCountry}, billing ${billingCountry.toUpperCase()}${via}`;
 }
 
 /** Detail wording for the 3DS signal. */

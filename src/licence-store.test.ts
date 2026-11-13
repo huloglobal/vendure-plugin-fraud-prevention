@@ -34,9 +34,9 @@ function postgres() {
 describe('licence key store on PostgreSQL', () => {
     it('stores an activated key with an ON CONFLICT upsert and reads it back', async () => {
         const db = postgres();
-        await expect(new FraudPreventionService(db.connection, {} as any, {} as any).saveStoredLicenceKey('a.licence.key')).resolves.toBeUndefined();
+        await expect(new FraudPreventionService(db.connection, {} as any, {} as any, {} as any).saveStoredLicenceKey('a.licence.key')).resolves.toBeUndefined();
         expect(db.upserts).toEqual([expect.stringContaining('ON CONFLICT (pluginId) DO UPDATE SET')]);
         // A second instance on the same database stands in for the next boot.
-        await expect(new FraudPreventionService(db.connection, {} as any, {} as any).loadStoredLicenceKey()).resolves.toBe('a.licence.key');
+        await expect(new FraudPreventionService(db.connection, {} as any, {} as any, {} as any).loadStoredLicenceKey()).resolves.toBe('a.licence.key');
     });
 });

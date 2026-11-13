@@ -8,7 +8,16 @@
 
 import type { CardChecks } from './avs';
 
-export type FraudMode = 'off' | 'monitor' | 'enforce';
+/**
+ * off      scored in the background (shadow), nothing else happens
+ * monitor  risky orders are flagged in the log
+ * hold     FREE: block-level orders are refused before the charge (at the
+ *          move to ArrangingPayment); risky placed orders are flagged
+ * enforce  PREMIUM: hold + review-level and block-level placed orders wait
+ *          in the review queue. Without premium it works as `hold`.
+ */
+export type FraudMode = 'off' | 'monitor' | 'hold' | 'enforce';
+export const FRAUD_MODES: FraudMode[] = ['off', 'monitor', 'hold', 'enforce'];
 
 export type RiskLevel = 'low' | 'medium' | 'review' | 'blocked';
 
@@ -28,7 +37,7 @@ export interface FraudAssessment {
     /** What the engine decided to do given the channel mode. 'shadow'
      *  means the order scored risky but protection was OFF, so no
      *  action was taken — surfaced to admins as a nudge to enable it. */
-    action: 'allow' | 'flag' | 'review' | 'block' | 'shadow';
+    action: 'allow' | 'flag' | 'hold' | 'review' | 'block' | 'shadow';
     mode: FraudMode;
     /** False when the channel was disabled/off at scoring time — the
      *  engine still scores (shadow mode) so the data is never blind. */
@@ -46,6 +55,9 @@ export interface FraudChannelConfig {
     blockThreshold: number;
     // When a case is pending, hold licence-key fulfilment (host integrates)
     holdFulfilment: boolean;
+    /** The channel's default currency: every value limit below is in its
+     *  minor units (read from the channel, not stored). */
+    currencyCode?: string;
     // Velocity limits
     maxOrdersPerIpPerHour: number;
     maxOrdersPerIpPerDay: number;
@@ -117,6 +129,8 @@ export const DEFAULT_WEIGHTS: Record<string, number> = {
     radar_risk_elevated: 15,
     radar_risk_highest: 35,
     three_ds_failed: 10,
+    cvc_fail: 30,
+    card_country_mismatch: 15,
 };
 
 export const DEFAULT_CONFIG: Omit<FraudChannelConfig, 'channelId' | 'channelCode'> = {
@@ -171,8 +185,26 @@ export interface FraudPreventionPluginOptions {
     /** Read `cf-connecting-ip` / `cf-ipcountry` from a trusted proxy.
      *  Default true (only takes effect with `trustedProxies`). */
     trustCloudflareHeader?: boolean;
-    /** Prune fraud_log rows older than this many days. Default 180; 0 = keep forever. */
+    /** Prune fraud_log rows older than this many days. Default 180; 0 = keep
+     *  forever. The admin Settings tab overrides it once saved there. */
     logRetentionDays?: number;
+    /** ip-api.com Pro key. Overrides the key saved on the Settings tab; IP
+     *  intelligence still has to be switched on there. Never the free
+     *  endpoint: ip-api.com forbids commercial use of it. */
+    ipApiKey?: string;
+    /** Extra signals from the host, scored with the built-in ones. Called
+     *  for every assessment (also the public pre-check and the pre-charge
+     *  check); return [] when nothing applies. A throw is logged and
+     *  ignored. Points are taken as given (signalWeights can override by
+     *  key). */
+    extraSignals?: (input: any, config: FraudChannelConfig) => Promise<FraudSignal[]> | FraudSignal[];
+    /** Approving a review case settles (captures) the order's Authorized
+     *  payments through `OrderService.settlePayment` (premium). Default true. */
+    captureOnApprove?: boolean;
+    /** Score every order on its move to ArrangingPayment and refuse a
+     *  block-level one before the charge in hold / enforce mode. Default
+     *  true. False keeps scoring after placement only. */
+    preChargeCheck?: boolean;
     /** Disable the daily threat-feed sync cron (default false). */
     disableFeedSync?: boolean;
     /** Supply card checks (AVS, Radar risk level, 3DS outcome) for

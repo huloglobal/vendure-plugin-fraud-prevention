@@ -44,6 +44,8 @@ const INTERPOLATIONS: Record<string, string | string[]> = {
     FEED_SYNC_LOCK_KEY: '5211883387260327236',
     "clauses.join(' AND ')": 'action IS NOT NULL',
     "sets.join(', ')": 'updatedAt = NOW()',
+    extra: ' AND o.id <> ? AND o.`currencyCode` = ?',
+    exclude: ' AND (l.orderId IS NULL OR l.orderId <> ?)',
 };
 
 const SQL_START = /^\s*(SELECT|INSERT|UPDATE|DELETE|CREATE|ALTER|DROP|WITH)\b/;
@@ -153,5 +155,91 @@ run('PostgreSQL corpus (HULO_PG_URL)', () => {
             await client.end();
         }
         expect(failures, failures.join('\n')).toEqual([]);
+    }, 60_000);
+});
+
+/**
+ * Behaviour of the queries added in 0.21.0, run through the service itself on
+ * Postgres: the fulfilment gate honouring "Hold fulfilment", unplaced attempts
+ * (refused / unpaid) that never make an order "assessed", the failed-payment
+ * cooldown, the orders-list risk lookup, channel currency and unpaid scoring.
+ */
+run('PostgreSQL behaviour (HULO_PG_URL)', () => {
+    it('gate, unplaced attempts, cooldown, risk column, currency and unpaid scoring work on Postgres', async () => {
+        const { Client } = await import('pg');
+        const { FraudPreventionService } = await import('../src/fraud-prevention.service');
+        const client = new Client({ connectionString: PG_URL });
+        await client.connect();
+        try {
+            await client.query('DROP SCHEMA public CASCADE');
+            await client.query('CREATE SCHEMA public');
+            for (const ddl of VENDURE_STAND_INS) await client.query(ddl);
+            const rawConnection = { options: { type: 'postgres' }, query: async (sql: string, params?: any[]) => (await client.query(sql, params)).rows };
+            const svc = new FraudPreventionService({ rawConnection } as any, {} as any, {} as any, { publish: () => undefined } as any);
+            await svc.onModuleInit();
+
+            await client.query(`INSERT INTO channel ("id", "code", "token", "defaultCurrencyCode") VALUES (1, 'default', 't1', 'EUR'), (2, 'b2b', 't2', 'JPY')`);
+            const cfg1 = await svc.getConfig(1);
+            expect(cfg1.currencyCode).toBe('EUR');
+            const cfg2 = await svc.getConfig(2);
+            expect(cfg2.currencyCode).toBe('JPY');
+            expect(cfg2.maxOrderValuePence).toBe(500_000 * 200); // defaults scaled to yen
+            await svc.saveConfig({ ...cfg1, holdFulfilment: false, cooldownMinutesAfterFailedPayment: 15, maxFailedPaymentsPerIpPerHour: 3 });
+
+            const a = { score: 80, level: 'blocked' as const, signals: [], allowlisted: false, action: 'block' as const, mode: 'enforce' as const };
+            await svc.createCase({ channelId: 1, orderId: 10, orderCode: 'C10', orderValuePence: 100 }, a);
+            await svc.createCase({ channelId: 2, orderId: 11, orderCode: 'C11', orderValuePence: 100 }, a);
+            const c13 = await svc.createCase({ channelId: 1, orderId: 13, orderCode: 'C13', orderValuePence: 100 }, a);
+            await client.query(`UPDATE fraud_blocked_orders SET status = 'rejected' WHERE id = $1`, [c13]);
+
+            expect((await svc.pendingOrderIds()).sort()).toEqual([11]);
+            expect((await svc.heldOrderIds()).sort()).toEqual([11, 13]);
+            let gate = await svc.fulfilmentGate(10);
+            expect(gate).toMatchObject({ assessed: false, held: false, caseStatus: 'pending', releasable: false });
+            await svc.logAssessment({ channelId: 1, orderId: 10, orderCode: 'C10', ip: '8.8.8.8', orderValuePence: 100 }, { ...a, action: 'review' });
+            gate = await svc.fulfilmentGate(10);
+            expect(gate.releasable).toBe(true);
+            expect((await svc.fulfilmentGate(11)).held).toBe(true);
+            expect((await svc.fulfilmentGate(13)).held).toBe(true);
+
+            // A refused attempt counts for velocity but never makes the order "assessed".
+            await svc.logAssessment({ channelId: 1, orderId: 12, orderCode: 'C12', ip: '8.8.8.8', orderValuePence: 100 }, a, 'refused');
+            expect(await svc.isAssessed(12)).toBe(false);
+            expect(await svc.assessedOrderIds([10, 12])).toEqual([10]);
+            expect(await (svc as any).unplacedAttemptsByIp('8.8.8.8')).toEqual({ hour: 1, day: 1 });
+            expect(await (svc as any).unplacedAttemptsByIp('8.8.8.8', 12)).toEqual({ hour: 0, day: 0 });
+
+            const risk = await svc.orderRisk([10, 12, 99]);
+            expect(risk['10']).toMatchObject({ score: 80, action: 'review', caseStatus: 'pending' });
+            expect(risk['12']).toMatchObject({ action: 'refused' });
+            expect(risk['99']).toBeUndefined();
+
+            // Failed-payment cooldown: three declines from one address, the latest just now.
+            await client.query(`INSERT INTO "order" ("id", "code", "state", "active", "customFieldsIp", "createdAt", "updatedAt") VALUES (20, 'C20', 'ArrangingPayment', true, '8.8.4.4', NOW(), NOW())`);
+            for (let i = 0; i < 3; i++) await client.query(`INSERT INTO payment ("orderId", "state", "method", "amount", "createdAt", "updatedAt") VALUES (20, 'Declined', 'card', 100, NOW() - interval '${i * 5} minutes', NOW())`);
+            const fp = await svc.failedPaymentState('8.8.4.4', await svc.getConfig(1));
+            expect(fp).toMatchObject({ hour: 3, window: 3, coolingDown: true });
+            const none = await svc.failedPaymentState('8.8.4.4', { ...(await svc.getConfig(1)), cooldownMinutesAfterFailedPayment: 0 });
+            expect(none.coolingDown).toBe(false);
+
+            // An order left in ArrangingPayment past the grace is scored once, as 'unpaid'.
+            await client.query(`INSERT INTO customer ("id", "emailAddress") VALUES (1, 'buyer@example.com')`);
+            await client.query(`INSERT INTO "order" ("id", "code", "state", "active", "customerId", "subTotalWithTax", "currencyCode", "customFieldsIp", "createdAt", "updatedAt")
+                                VALUES (30, 'C30', 'ArrangingPayment', true, 1, 4200, 'EUR', '1.1.1.1', NOW() - interval '40 minutes', NOW() - interval '20 minutes')`);
+            await client.query(`INSERT INTO order_channels_channel ("orderId", "channelId") VALUES (30, 1)`);
+            expect(await svc.scoreUnpaidOrders()).toBe(1);
+            expect(await svc.scoreUnpaidOrders()).toBe(0);
+            const { rows } = await client.query(`SELECT action, ordercode FROM fraud_log WHERE orderid = 30`);
+            expect(rows).toEqual([{ action: 'unpaid', ordercode: 'C30' }]);
+            expect(await svc.isAssessed(30)).toBe(false);
+
+            // Settings live in hulo_plugin_prefs; the key is never returned.
+            const st = await svc.saveGeneralSettings({ ipIntelEnabled: true, ipIntelKey: 'abcdef123456', logRetentionDays: 30 });
+            expect(st).toMatchObject({ ipIntelEnabled: true, ipIntelKeySet: true, ipIntelKeyHint: '…3456', logRetentionDays: 30 });
+            expect(JSON.stringify(st)).not.toContain('abcdef123456');
+            expect(await svc.effectiveRetentionDays()).toBe(30);
+        } finally {
+            await client.end();
+        }
     }, 60_000);
 });

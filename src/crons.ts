@@ -35,11 +35,19 @@ export class FraudCrons {
         if (n > 0) Logger.info(`Auto-released ${n} stale fraud case(s)`, loggerCtx);
     }
 
-    /** Nightly audit-log retention. */
+    /** Orders left in ArrangingPayment past the 15-minute grace get their 'unpaid' score (free). */
+    @Cron('*/10 * * * *')
+    async scoreUnpaid() {
+        if (this.processContext.isServer) return;
+        const n = await this.service.scoreUnpaidOrders().catch(() => 0);
+        if (n > 0) Logger.verbose(`Scored ${n} unpaid order(s)`, loggerCtx);
+    }
+
+    /** Nightly audit-log retention: the Settings tab value, else the logRetentionDays option (default 180). */
     @Cron(CronExpression.EVERY_DAY_AT_4AM)
     async pruneLog() {
         if (this.processContext.isServer) return;
-        const days = getOptions().logRetentionDays ?? 180;
+        const days = await this.service.effectiveRetentionDays();
         const removed = await this.service.pruneLog(days);
         if (removed > 0) Logger.info(`Pruned ${removed} fraud_log rows older than ${days}d`, loggerCtx);
     }

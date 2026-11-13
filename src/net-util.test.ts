@@ -219,3 +219,35 @@ describe('clientIpFromRequest', () => {
         expect(clientIpFromRequest(r, { trustedProxies: proxies, trustCloudflareHeader: false })).toBe('198.51.100.9');
     });
 });
+
+import { ignoredForwarding, isPublicIp } from './net-util';
+
+describe('isPublicIp', () => {
+    it('accepts public IPv4 / IPv6 and rejects private, reserved and malformed', () => {
+        for (const ip of ['8.8.8.8', '81.2.69.160', '2a00:1450:4009:81c::200e', '::ffff:8.8.8.8']) expect(isPublicIp(ip)).toBe(true);
+        for (const ip of ['10.0.0.1', '172.31.255.1', '192.168.1.2', '127.0.0.1', '100.64.0.1', '169.254.0.5', '0.0.0.0',
+            '192.0.2.1', '198.51.100.2', '203.0.113.9', '224.0.0.1', '255.255.255.255', '::1', '::', 'fc00::1', 'fe80::1', '2001:db8::5', 'nope', '']) {
+            expect(isPublicIp(ip)).toBe(false);
+        }
+    });
+});
+
+describe('ignoredForwarding (misconfigured-proxy detection)', () => {
+    const req = (peer: string, headers: Record<string, string>, ip?: string) => ({ headers, ip: ip ?? peer, socket: { remoteAddress: peer } });
+
+    it('reports a peer whose forwarding header was ignored', () => {
+        expect(ignoredForwarding(req('10.0.0.5', { 'x-forwarded-for': '8.8.8.8' }))).toEqual({ peer: '10.0.0.5', header: 'x-forwarded-for', client: '8.8.8.8' });
+        expect(ignoredForwarding(req('10.0.0.5', { 'cf-connecting-ip': '1.1.1.1' }))).toMatchObject({ header: 'cf-connecting-ip', client: '1.1.1.1' });
+    });
+
+    it('stays quiet when the header was applied (trusted proxy, or Express trust proxy)', () => {
+        expect(ignoredForwarding(req('10.0.0.5', { 'x-forwarded-for': '8.8.8.8' }), { trustedProxies: ['10.0.0.0/8'] })).toBeNull();
+        expect(ignoredForwarding(req('10.0.0.5', { 'x-forwarded-for': '8.8.8.8' }, '8.8.8.8'))).toBeNull();
+    });
+
+    it('stays quiet without headers, or when the header names a private address or the peer itself', () => {
+        expect(ignoredForwarding(req('10.0.0.5', {}))).toBeNull();
+        expect(ignoredForwarding(req('10.0.0.5', { 'x-forwarded-for': '192.168.0.4' }))).toBeNull();
+        expect(ignoredForwarding(req('8.8.8.8', { 'x-forwarded-for': '8.8.8.8' }))).toBeNull();
+    });
+});
