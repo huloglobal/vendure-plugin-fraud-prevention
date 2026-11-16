@@ -159,6 +159,25 @@ export const DEFAULT_CONFIG: Omit<FraudChannelConfig, 'channelId' | 'channelCode
     signalWeights: {},
 };
 
+export interface FraudEmailOptions {
+    /** Header and sign-off name. Default: the display name of the SMTP
+     *  `from` address, else its domain. */
+    storeName?: string;
+    /** Accent colour (`#rgb` or `#rrggbb`) for the bar under the header and
+     *  buttons. Default `#155dfc`. */
+    accentColor?: string;
+    /** Logo shown instead of the store name (https only). */
+    logoUrl?: string;
+    /** Logo width in px (16-400). Default 140. */
+    logoWidth?: number;
+    /** Footer or legal text under every e-mail (plain text). */
+    footerText?: string;
+    /** Support address shown under the sign-off of customer notices; also
+     *  the `{{supportEmail}}` template variable when set. Default: the alert
+     *  e-mail address from the Notifications settings (as before). */
+    supportEmail?: string;
+}
+
 export interface FraudPreventionPluginOptions {
     /** Public-facing host, used in admin notification links. */
     publicBaseUrl?: string;
@@ -173,6 +192,9 @@ export interface FraudPreventionPluginOptions {
         pass: string;
         from: string;
     };
+    /** Look of the e-mails the plugin sends (customer held / approved /
+     *  rejected notices and admin alerts). All optional. */
+    email?: FraudEmailOptions;
     /** Rate limit for the public /fraud-prevention/check endpoint. */
     rateLimit?: { capacity: number; windowMs: number };
     /** Reverse proxies / load balancers (addresses or CIDRs, IPv4 or IPv6)

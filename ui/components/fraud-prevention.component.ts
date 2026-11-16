@@ -1,4 +1,5 @@
 import { Component, OnInit, ChangeDetectorRef, ViewChild, ElementRef } from '@angular/core';
+import { DomSanitizer, SafeHtml } from '@angular/platform-browser';
 import { HttpClient } from '@angular/common/http';
 import { NotificationService, ModalService, AssetPickerDialogComponent } from '@vendure/admin-ui/core';
 
@@ -922,6 +923,7 @@ type Tab = 'overview' | 'rules' | 'review' | 'lists' | 'simulate' | 'lookup' | '
                                             </div>
                                         </ng-container>
                                     </ng-container>
+                                    <p class="muted" style="font-size:12px;margin-top:6px">Saved webhook URLs, the bot token and the signing secret are shown as dots and never sent back to the browser. Type over them to change them.</p>
                                 </div>
                             </div>
                         </div>
@@ -1011,7 +1013,7 @@ type Tab = 'overview' | 'rules' | 'review' | 'lists' | 'simulate' | 'lookup' | '
                             </div>
                             <div *ngIf="tplPreview" class="tpl-preview">
                                 <div class="tpl-preview-subject">{{ tplPreview.subject }}</div>
-                                <div [innerHTML]="tplPreview.html"></div>
+                                <iframe class="tpl-preview-frame" sandbox="" [srcdoc]="tplPreviewDoc" title="E-mail preview" style="width:100%;height:560px;border:1px solid #e5e7eb;border-radius:8px;background:#f3f4f6"></iframe>
                             </div>
                         </div>
                     </div>
@@ -1663,6 +1665,8 @@ export class FraudPreventionComponent implements OnInit {
     ];
     tplDirty = false;
     tplPreview: any = null;
+    /** The preview e-mail as sent, rendered in a sandboxed (script-free) iframe so its inline styles survive. */
+    tplPreviewDoc: SafeHtml | null = null;
     tplSelected: Record<string, boolean> = {};
     get anyTplSelected(): boolean { return this.templateKinds.some(k => this.tplSelected[k.key]); }
 
@@ -1671,6 +1675,7 @@ export class FraudPreventionComponent implements OnInit {
         private notification: NotificationService,
         private cdr: ChangeDetectorRef,
         private modalService: ModalService,
+        private sanitizer: DomSanitizer,
     ) {}
 
     get current(): FraudConfig | null {
@@ -2498,9 +2503,9 @@ export class FraudPreventionComponent implements OnInit {
         if (!this.current || !this.templates) return;
         const t = this.templates[this.tplKind];
         this.http.post<any>('/fraud-prevention/templates/preview', {
-            channelId: this.current.channelId, subject: t.subject, body: t.body,
+            channelId: this.current.channelId, kind: this.tplKind, subject: t.subject, body: t.body,
         }).subscribe({
-            next: p => { this.tplPreview = p; this.cdr.markForCheck(); },
+            next: p => { this.tplPreview = p; this.tplPreviewDoc = this.sanitizer.bypassSecurityTrustHtml(String(p?.html || '')); this.cdr.markForCheck(); },
             error: () => this.notification.error('Preview failed'),
         });
     }

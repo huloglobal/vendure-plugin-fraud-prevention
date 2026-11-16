@@ -10,6 +10,7 @@ import { clientIpFromRequest, fromTrustedProxy } from './net-util';
 import { CUSTOM_FEED_PRESETS, FRAUD_SOURCES } from './fraud-sources';
 import { FraudChannelConfig } from './types';
 import { formatMinor } from './money';
+import { clampTake, maskNotificationSecrets, unmaskNotificationSecrets, validateNotificationConfig, validateTemplateSave } from './admin-input';
 
 /** Admin surface requires a logged-in admin with catalog permissions —
  *  same convention as the rest of the HULO suite. Returns true when the
@@ -332,7 +333,7 @@ export class FraudPreventionController {
         @Query('signal') signal?: string, @Query('take') take?: string,
     ) {
         if (denyUnlessAdmin(ctx, res, false)) return;
-        return res.json(await this.service.log({ level, action, signal, take: Number(take || 100) }));
+        return res.json(await this.service.log({ level, action, signal, take: clampTake(take) }));
     }
 
     // ── Admin: review queue ────────────────────────────────────────────
@@ -465,32 +466,32 @@ export class FraudPreventionController {
         @Body() body: { channelId: number; kind: string; subject: string; body: string; reset?: boolean },
     ) {
         if (denyUnlessAdmin(ctx, res, true)) return;
-        if (!['held', 'approved', 'rejected'].includes(body.kind)) {
-            return res.status(400).json({ error: 'bad kind' });
-        }
+        const err = validateTemplateSave(body);
+        if (err) return res.status(400).json({ error: 'bad-request', message: err });
+        const channelId = Number(body.channelId);
         if (body.reset) {
-            await this.service.resetTemplate(Number(body.channelId), body.kind as any);
+            await this.service.resetTemplate(channelId, body.kind as any);
         } else {
-            await this.service.saveTemplate(Number(body.channelId), body.kind as any, body.subject || '', body.body || '');
+            await this.service.saveTemplate(channelId, body.kind as any, String(body.subject).trim(), String(body.body));
         }
         return res.json({ success: true });
     }
 
+    /** The message exactly as it would be sent (shared layout, sample order values), with its plain-text version. */
     @Post('templates/preview')
-    async previewTemplate(@Ctx() ctx: RequestContext, @Res() res: Response, @Body() body: { subject: string; body: string; channelId?: number }) {
+    async previewTemplate(
+        @Ctx() ctx: RequestContext, @Res() res: Response,
+        @Body() body: { subject: string; body: string; channelId?: number; kind?: string },
+    ) {
         if (denyUnlessAdmin(ctx, res, false)) return;
-        const { renderTemplate, renderBody } = await import('./templates');
-        const notif = await this.service.getNotificationConfig();
-        const cfg = await this.service.getConfig(Number(body.channelId || 1));
-        const vars = {
-            orderCode: 'DEMO12345678', firstName: 'Sam',
-            supportEmail: notif.adminEmail || 'support@example.com',
-            reviewHours: (cfg as any).reviewHours ?? 24,
-        };
-        return res.json({
-            subject: renderTemplate(body.subject || '', vars),
-            html: renderBody(renderTemplate(body.body || '', vars)),
-        });
+        const kind = (['held', 'approved', 'rejected'].includes(String(body?.kind)) ? body.kind : 'held') as 'held' | 'approved' | 'rejected';
+        const channelId = Number(body?.channelId) > 0 ? Number(body.channelId) : 1;
+        const mail = await this.service.renderCustomerMessage(
+            channelId, kind,
+            { subject: String(body?.subject ?? '').slice(0, 500), body: String(body?.body ?? '').slice(0, 50_000) },
+            { orderCode: 'DEMO12345678', firstName: 'Sam' },
+        );
+        return res.status(200).json(mail);
     }
 
     // ── Admin: lists ───────────────────────────────────────────────────
@@ -679,13 +680,18 @@ export class FraudPreventionController {
     @Get('notification-config')
     async getNotif(@Ctx() ctx: RequestContext, @Res() res: Response) {
         if (denyUnlessAdmin(ctx, res, false)) return;
-        return res.json(await this.service.getNotificationConfig());
+        // Webhook URLs, the bot token and the signing secret are credentials: never sent back.
+        res.setHeader('cache-control', 'private, no-store');
+        return res.json(maskNotificationSecrets(await this.service.getNotificationConfig()));
     }
 
     @Post('notification-config')
     async saveNotif(@Ctx() ctx: RequestContext, @Res() res: Response, @Body() body: any) {
         if (denyUnlessAdmin(ctx, res, true)) return;
-        await this.service.saveNotificationConfig(body);
+        const current = await this.service.getNotificationConfig();
+        const err = validateNotificationConfig(body);
+        if (err) return res.status(400).json({ error: 'bad-request', message: err });
+        await this.service.saveNotificationConfig(unmaskNotificationSecrets(body || {}, current));
         return res.json({ success: true });
     }
 }

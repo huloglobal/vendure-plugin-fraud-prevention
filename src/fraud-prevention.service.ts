@@ -49,7 +49,9 @@ import {
     threeDsFailed,
 } from './avs';
 import { domainHasMx, lookupIpIntel, looksGibberish, IpIntel } from './ip-intel';
-import { DEFAULT_TEMPLATES, MessageKind, renderTemplate, renderBody } from './templates';
+import { DEFAULT_TEMPLATES, MessageKind, buildCustomerMessage } from './templates';
+import { EmailBrand, renderEmail } from './email-layout';
+import { AlertContent, alertEmail, refusedAlert } from './alerts';
 import { fanOutOpsEvent, OpsEvent } from './ops-notify';
 
 const loggerCtx = 'FraudPrevention';
@@ -69,7 +71,6 @@ export const PREMIUM_FEATURES = [
     'Weekly report and setup checklist',
 ];
 
-const esc = (v: unknown) => String(v ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c] as string));
 
 /** Lazy plugin lookup (avoids a static plugin<->service import cycle at load time). */
 function premiumActive(): boolean {
@@ -1713,7 +1714,7 @@ export class FraudPreventionService implements OnModuleInit {
         if (prefix) { clauses.push(`signals LIKE ?`); params.push(`%"key":"${prefix}%`); }
         return this.db.query(
             `SELECT * FROM fraud_log WHERE ${clauses.join(' AND ')}
-             ORDER BY createdAt DESC LIMIT ${Math.min(filter.take || 100, 500)}`,
+             ORDER BY createdAt DESC LIMIT ${Math.min(Math.max(1, Math.floor(Number(filter.take)) || 100), 500)}`,
             params,
         ).catch(() => []);
     }
@@ -2002,13 +2003,10 @@ export class FraudPreventionService implements OnModuleInit {
             });
             const notif = await this.getNotificationConfig();
             if (notif.notifyOnBlocked) {
-                await this.sendAdminAlert(`Order ${input.orderCode || ''} refused before payment (score ${a.score})`,
-                    `<h2>⛔ Order refused before payment</h2>
-                     <p><strong>Order:</strong> ${esc(input.orderCode || '')} (${esc(money)})</p>
-                     <p><strong>Customer:</strong> ${esc(input.email || '')}</p>
-                     <p><strong>Reason:</strong> ${reason === 'block-level' ? `risk score ${a.score}/100 (block level)` : 'failed-payment cooldown'}</p>
-                     <ul>${a.signals.map(sg => `<li>${esc(sg.label)} (+${sg.points}): ${esc(sg.detail)}</li>`).join('')}</ul>
-                     <p>No payment was taken.</p>`);
+                await this.sendAdminAlert(`Order ${input.orderCode || ''} refused before payment (score ${a.score})`, refusedAlert({
+                    orderCode: input.orderCode || '', email: input.email || '', score: a.score, level: a.level,
+                    signals: a.signals, amount: money, reason,
+                }));
             }
         } catch { /* alerts never affect the order */ }
     }
@@ -2566,18 +2564,49 @@ export class FraudPreventionService implements OnModuleInit {
         to: string,
         vars: { orderCode?: string; firstName?: string },
     ): Promise<void> {
-        const templates = await this.getTemplates(channelId);
+        const mail = await this.renderCustomerMessage(channelId, kind, undefined, vars);
+        await this.deliverCustomerMail(to, mail);
+    }
+
+    /** Template variables for customer notices (preview uses sample order values). */
+    async customerVars(channelId: number, vars: { orderCode?: string; firstName?: string }) {
         const cfg = await this.getConfig(channelId);
         const notif = await this.getNotificationConfig();
-        const allVars = {
+        return {
             orderCode: vars.orderCode || '',
             firstName: vars.firstName || 'there',
-            supportEmail: notif.adminEmail || this.options.defaultAdminEmail || '',
+            supportEmail: this.options.email?.supportEmail || notif.adminEmail || this.options.defaultAdminEmail || '',
             reviewHours: cfg.reviewHours ?? 24,
         };
-        const subject = renderTemplate(templates[kind].subject, allVars);
-        const bodyHtml = renderBody(renderTemplate(templates[kind].body, allVars));
-        await this.sendCustomerNotice(to, subject, bodyHtml);
+    }
+
+    /** A customer notice exactly as it is sent: subject, HTML in the shared layout, plain text.
+     *  `override` renders an unsaved subject/body (the Settings preview). */
+    async renderCustomerMessage(
+        channelId: number, kind: MessageKind, override: { subject: string; body: string } | undefined,
+        vars: { orderCode?: string; firstName?: string },
+    ): Promise<{ subject: string; html: string; text: string }> {
+        const tpl = override ?? (await this.getTemplates(channelId))[kind];
+        const allVars = await this.customerVars(channelId, vars);
+        return buildCustomerMessage(kind, tpl, allVars, this.emailBrand(true));
+    }
+
+    /** Header, accent, logo and footer for every e-mail (plugin `email` option). */
+    emailBrand(customer = false): EmailBrand {
+        const o = this.options.email || {};
+        const from = this.smtpSettings()?.from || '';
+        const display = /^\s*"?([^"<]+?)"?\s*<[^>]+>\s*$/.exec(from)?.[1]?.trim() || '';
+        const domain = /@([^\s>]+)/.exec(from)?.[1] || '';
+        let host = '';
+        try { host = this.options.publicBaseUrl ? new URL(this.options.publicBaseUrl).hostname : ''; } catch { /* ignore */ }
+        return {
+            storeName: (o.storeName || '').trim() || display || host || domain || 'Our store',
+            accentColor: o.accentColor || null,
+            logoUrl: o.logoUrl || null,
+            logoWidth: o.logoWidth ?? null,
+            footerText: o.footerText || null,
+            supportEmail: customer ? (o.supportEmail || null) : null,
+        };
     }
 
     // ── Notifications ──────────────────────────────────────────────────
@@ -2665,34 +2694,43 @@ export class FraudPreventionService implements OnModuleInit {
         ]).finally(() => clearTimeout(timer));
     }
 
-    /** Admin e-mail alerts are premium (licence or evaluation); they stop when it lapses. */
-    async sendAdminAlert(subject: string, html: string): Promise<void> {
+    /** Admin e-mail alerts are premium (licence or evaluation); they stop when it lapses.
+     *  `content` is structured alert content (laid out in the shared compact design);
+     *  a string is treated as trusted HTML for hosts that call this directly. */
+    async sendAdminAlert(subject: string, content: AlertContent | string): Promise<void> {
         if (!premiumActive()) return;
         try {
             const smtp = this.smtpSettings();
             if (!smtp) return;
             const cfg = await this.getNotificationConfig();
             if (!cfg.adminEmail) return;
+            const mail = typeof content === 'string'
+                ? renderEmail({ brand: this.emailBrand(), heading: 'Fraud alert', blocks: [{ type: 'html', html: content }], compact: true, signOff: false })
+                : alertEmail(content, this.emailBrand());
             await this.sendWithDeadline({
                 from: smtp.from, to: cfg.adminEmail,
-                subject: `[Fraud Alert] ${subject}`,
-                html: `<div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:20px">${html}</div>`,
+                subject: `[Fraud alert] ${subject}`,
+                html: mail.html, text: mail.text,
             });
         } catch (e: any) {
             Logger.error(`Admin alert failed: ${e.message}`, loggerCtx);
         }
     }
 
-    async sendCustomerNotice(to: string, subject: string, html: string): Promise<void> {
+    /** Send an already-rendered customer notice. */
+    private async deliverCustomerMail(to: string, mail: { subject: string; html: string; text: string }): Promise<void> {
         try {
             const smtp = this.smtpSettings();
             if (!smtp || !to) return;
-            await this.sendWithDeadline({
-                from: smtp.from, to, subject,
-                html: `<div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:20px">${html}</div>`,
-            });
+            await this.sendWithDeadline({ from: smtp.from, to, subject: mail.subject, html: mail.html, text: mail.text });
         } catch (e: any) {
             Logger.error(`Customer notice failed: ${e.message}`, loggerCtx);
         }
+    }
+
+    /** Customer notice from trusted HTML (kept for hosts that call it directly), in the shared layout. */
+    async sendCustomerNotice(to: string, subject: string, html: string): Promise<void> {
+        const mail = renderEmail({ brand: this.emailBrand(true), blocks: [{ type: 'html', html }] });
+        await this.deliverCustomerMail(to, { subject, ...mail });
     }
 }

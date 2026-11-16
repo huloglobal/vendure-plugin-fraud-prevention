@@ -1017,4 +1017,58 @@ run('@huloglobal/vendure-plugin-fraud-prevention (MariaDB)', () => {
         svc().setOptions(opts);
         setPremium(false);
     });
+    it('notification credentials are masked on read and kept when the mask is saved back; bad input is refused', async () => {
+        const slack = 'https://hooks.slack.com/services/T000/B000/secretpart';
+        const put = await adminFetch('notification-config', { method: 'POST', body: { adminEmail: 'ops@test.local', notifyOnBlocked: true, notifyOnHighRisk: true, slackWebhookUrl: slack, telegramBotToken: '123:abc', telegramChatId: '42' } });
+        expect([200, 201]).toContain(put.status);
+        const got = await adminFetch('notification-config');
+        expect(got.status).toBe(200);
+        expect(JSON.stringify(got.body)).not.toContain('secretpart');
+        expect(got.body.telegramBotToken).not.toBe('123:abc');
+        expect([200, 201]).toContain((await adminFetch("notification-config", { method: "POST", body: got.body })).status);
+        const stored = await svc().getNotificationConfig();
+        expect(stored.slackWebhookUrl).toBe(slack);
+        expect(stored.telegramBotToken).toBe('123:abc');
+        expect((await adminFetch('notification-config', { method: 'POST', body: { ...got.body, adminEmail: 'nope' } })).status).toBe(400);
+        expect((await adminFetch('notification-config', { method: 'POST', body: { ...got.body, genericWebhookUrl: 'http://internal/' } })).status).toBe(400);
+        await adminFetch('notification-config', { method: 'POST', body: { adminEmail: 'ops@test.local', notifyOnBlocked: true, notifyOnHighRisk: true, notifyOnApproval: true, notifyOnRejection: true } });
+    });
+
+    it('customer-message saves are validated and the preview is the e-mail as sent, with a text version', async () => {
+        expect((await adminFetch('templates', { method: 'POST', body: { kind: 'held', subject: 'S', body: 'B' } })).status).toBe(400);
+        expect((await adminFetch('templates', { method: 'POST', body: { kind: 'held', channelId: 1, subject: '  ', body: 'B' } })).status).toBe(400);
+        const p = await adminFetch('templates/preview', { method: 'POST', body: { channelId: 1, kind: 'approved', subject: 'Order {{orderCode}}', body: '<p>Hi <b>{{firstName}}</b></p>' } });
+        expect(p.status).toBe(200);
+        expect(p.body.subject).toBe('Order DEMO12345678');
+        expect(p.body.html).toContain('max-width:600px');
+        expect(p.body.html).toContain('Your order is confirmed');
+        expect(p.body.html).toContain('Kind regards,');
+        expect(p.body.text).toContain('Hi Sam');
+    });
+
+    it('customer notices and premium alerts go out in the shared layout with a plain-text part', async () => {
+        const s: any = svc();
+        const sent: any[] = [];
+        const origSend = s.sendWithDeadline, origSmtp = s.smtpSettings;
+        s.sendWithDeadline = async (m: any) => { sent.push(m); };
+        s.smtpSettings = () => ({ host: 'smtp.test', port: 587, user: 'u', pass: 'p', from: '"Test Shop" <shop@test.local>' });
+        try {
+            await svc().sendCustomerTemplate(1, 'held', 'buyer@example.com', { orderCode: 'ORD<1>', firstName: '<i>Jo</i>' });
+            expect(sent[0].to).toBe('buyer@example.com');
+            expect(sent[0].html).toContain('Test Shop');
+            expect(sent[0].html).toContain('ORD&lt;1&gt;');
+            expect(sent[0].html).not.toContain('<i>Jo</i>');
+            expect(sent[0].text).toContain('Hi <i>Jo</i>,');
+            setPremium(true);
+            await svc().sendAdminAlert('x', { heading: 'Order held', rows: [{ label: 'Order', value: '<b>X</b>' }] });
+            expect(sent[1].subject).toBe('[Fraud alert] x');
+            expect(sent[1].html).toContain('&lt;b&gt;X&lt;/b&gt;');
+            expect(sent[1].text).toContain('Order: <b>X</b>');
+            setPremium(false);
+            await svc().sendAdminAlert('y', { heading: 'Nope' });
+            expect(sent.length).toBe(2);
+        } finally {
+            s.sendWithDeadline = origSend; s.smtpSettings = origSmtp; setPremium(false);
+        }
+    });
 });

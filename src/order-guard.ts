@@ -3,9 +3,9 @@ import { EventBus, Logger, OrderPlacedEvent, ProcessContext } from '@vendure/cor
 import { FraudPreventionService, AssessInput } from './fraud-prevention.service';
 import { normaliseIp } from './net-util';
 import { FraudAssessedEvent } from './events';
+import { flaggedAlert, heldAlert, shadowAlert } from './alerts';
 
 const loggerCtx = 'FraudPrevention';
-const esc = (v: unknown) => String(v ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c] as string));
 
 /**
  * The enforcement point the old implementation never had: every placed
@@ -112,14 +112,8 @@ export class FraudOrderGuard implements OnApplicationBootstrap {
                 const notif = await this.service.getNotificationConfig();
                 if (notif.notifyOnHighRisk) {
                     void this.service.sendAdminAlert(
-                        `Protection inactive: order ${order.code} scored ${assessment.score}/100`,
-                        `<h2>⚠️ Fraud protection scored this order — but is switched OFF</h2>
-                         <p><strong>Order:</strong> ${order.code}</p>
-                         <p><strong>Customer:</strong> ${email}</p>
-                         <p><strong>Risk score:</strong> ${assessment.score}/100 (${assessment.level})</p>
-                         <ul>${assessment.signals.map(s => `<li>${s.label} (+${s.points}): ${s.detail}</li>`).join('')}</ul>
-                         <p><strong>No action was taken</strong> because protection is disabled for this channel.
-                         Enable it in Fraud Prevention → Settings to hold orders like this automatically.</p>`,
+                        `Protection off: order ${order.code} scored ${assessment.score}/100`,
+                        shadowAlert({ orderCode: order.code, orderId: order.id, email, score: assessment.score, level: assessment.level, signals: assessment.signals }),
                     );
                 }
             }
@@ -143,16 +137,12 @@ export class FraudOrderGuard implements OnApplicationBootstrap {
                     signals: assessment.signals.map(s => ({ key: s.key, label: s.label, points: s.points })),
                 });
                 if (notif.notifyOnHighRisk) {
-                    const base = this.service.getOptions().publicBaseUrl || '';
                     void this.service.sendAdminAlert(
                         `Order ${order.code} flagged (score ${assessment.score})`,
-                        `<h2>⚠️ Risky order flagged</h2>
-                         <p><strong>Order:</strong> ${esc(order.code)}</p>
-                         <p><strong>Customer:</strong> ${esc(email)}</p>
-                         <p><strong>Risk score:</strong> ${assessment.score}/100 (${assessment.level})</p>
-                         <ul>${assessment.signals.map(s => `<li>${esc(s.label)} (+${s.points}): ${esc(s.detail)}</li>`).join('')}</ul>
-                         <p>It is <strong>not</strong> in the review queue (${assessment.mode} mode). Check it before you fulfil it.</p>
-                         ${base ? `<p><a href="${base}/admin/orders/${order.id}">Open the order →</a></p>` : ''}`,
+                        flaggedAlert({
+                            orderCode: order.code, orderId: order.id, email, score: assessment.score, level: assessment.level,
+                            signals: assessment.signals, mode: assessment.mode, baseUrl: this.service.getOptions().publicBaseUrl,
+                        }),
                     );
                 }
             }
@@ -179,16 +169,12 @@ export class FraudOrderGuard implements OnApplicationBootstrap {
         const notif = await this.service.getNotificationConfig();
         const wantAdminMail = assessment.action === 'block' ? notif.notifyOnBlocked : notif.notifyOnHighRisk;
         if (wantAdminMail) {
-            const base = this.service.getOptions().publicBaseUrl || '';
             void this.service.sendAdminAlert(
                 `Order ${order.code} held for review (score ${assessment.score})`,
-                `<h2>${assessment.action === 'block' ? '🚫 High-risk order held' : '⚠️ Order held for review'}</h2>
-                 <p><strong>Order:</strong> ${order.code}</p>
-                 <p><strong>Customer:</strong> ${email}</p>
-                 <p><strong>Risk score:</strong> ${assessment.score}/100 (${assessment.level})</p>
-                 <ul>${assessment.signals.map(s => `<li>${s.label} (+${s.points}): ${s.detail}</li>`).join('')}</ul>
-                 <p>Licence fulfilment is held until the case is resolved.</p>
-                 ${base ? `<p><a href="${base}/admin/extensions/fraud-prevention">Review in Admin →</a></p>` : ''}`,
+                heldAlert({
+                    orderCode: order.code, orderId: order.id, email, score: assessment.score, level: assessment.level,
+                    signals: assessment.signals, block: assessment.action === 'block', baseUrl: this.service.getOptions().publicBaseUrl,
+                }),
             );
         }
 
