@@ -5,6 +5,27 @@ documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) and this project
 adheres to [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.22.0] — 2026-11-16
+
+### Added
+- **E-mail design.** Customer notices (held, approved, rejected) and admin alerts use one layout: a 600px card with the merchant's logo or store name over an accent bar, an order box, info and warning boxes, buttons, a "Kind regards," sign-off and an optional footer. Inline styles only; every value escaped. Admin alerts use a compact version.
+- **Plain-text part** on every e-mail.
+- **`email` option:** `storeName`, `accentColor` (default `#155dfc`), `logoUrl` (https only), `logoWidth`, `footerText`, `supportEmail`.
+- Customer-message **Preview** shows the e-mail exactly as sent, in a sandboxed frame, and returns its plain-text version.
+
+### Changed
+- Default customer messages: British spelling ("e-mail", "working days"); dropped the "keeps prices down" line and the promise of a full refund (refunds depend on `refundOnReject`). Messages you have edited are not changed.
+- `sendAdminAlert(subject, content)` takes structured alert content; a string is still accepted as HTML.
+- Dev dependencies: `@nestjs/common` ^12.5.0, `@nestjs/schedule` ^12.0.4, `mysql2` ^3.24.6.
+
+### Fixed
+- Two admin alerts (protection off, held for review) put the order code, customer e-mail and signal details into the HTML unescaped.
+- Variables in an HTML customer message (the customer's first name) were not escaped.
+- `GET /fraud-prevention/notification-config` returned the Slack/Discord/Teams webhook URLs, the Telegram bot token and the webhook signing secret to any admin with read permission. They are now masked, and a masked value saved back keeps the stored one.
+- Notification settings are validated (alert address, https webhook URLs, lengths).
+- Saving a customer message without a channel failed in SQL, and an empty subject was accepted; both now answer 400.
+- A non-numeric `take` on the activity log reached SQL as `LIMIT NaN`.
+
 ## [0.21.0] — 2026-11-13
 
 ### Added

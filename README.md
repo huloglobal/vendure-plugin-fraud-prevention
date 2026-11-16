@@ -333,6 +333,7 @@ behind a proxy, list it in `trustedProxies`.
 | `licenceKey` | — | JWT from huloglobal.com; also activatable from the admin |
 | `defaultAdminEmail` | — | Where fraud-alert emails go when no per-install setting exists |
 | `smtp` | `SMTP_*` env | SMTP transport for alerts and customer notices |
+| `email` | — | Look of the e-mails: `storeName`, `accentColor` (`#155dfc`), `logoUrl` (https), `logoWidth` (140), `footerText`, `supportEmail`. See *E-mails* below |
 | `rateLimit` | 60 / min | Rate limit for the public `/fraud-prevention/check` endpoint |
 | `trustedProxies` | — | Proxies (IPs/CIDRs) whose `cf-connecting-ip` / right-most untrusted `x-forwarded-for` hop / `cf-ipcountry` the pre-check believes |
 | `trustCloudflareHeader` | true | Read `cf-connecting-ip` / `cf-ipcountry` from a trusted proxy |
@@ -345,6 +346,30 @@ behind a proxy, list it in `trustedProxies`.
 | `avsResolver` | — | Supply `CardChecks` (AVS, Radar, 3DS) for any gateway |
 | `cancelOnReject` | true | Rejecting a case cancels the order through Vendure |
 | `refundOnReject` | true | Rejecting a case refunds settled payments in full |
+
+### E-mails
+
+Customer notices (held, approved, rejected) and the admin fraud alerts share
+one layout: a 600px white card with your logo (or store name) over an accent
+bar, an order box, the message, "Kind regards," with your store name, and an
+optional footer strip for your legal text. Every e-mail has a plain-text part.
+
+```ts
+FraudPreventionPlugin.init({
+    email: {
+        storeName: 'Example Shop',               // default: the SMTP "from" display name, else its domain
+        accentColor: '#155dfc',                  // #rgb or #rrggbb
+        logoUrl: 'https://example.com/logo.png', // https only
+        logoWidth: 140,
+        footerText: 'Example Shop Ltd, registered in England and Wales, no. 01234567',
+        supportEmail: 'help@example.com',        // shown under the sign-off; also {{supportEmail}}
+    },
+});
+```
+
+The customer messages stay editable per channel (Settings → Customer
+messages, plain text or the visual editor); **Preview** shows the e-mail
+exactly as it is sent. Admin alerts use a compact version of the same layout.
 
 ## Licensing
 
